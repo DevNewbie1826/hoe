@@ -26,7 +26,7 @@ type Conn struct {
 	base                        context.Context
 	state                       atomic.Int32
 	mu                          sync.Mutex
-	cancel                      context.CancelFunc
+	cancel                      interface{ Cancel() }
 	eof                         bool
 	bodyDone                    bool
 	serving                     bool
@@ -70,7 +70,7 @@ func (c *Conn) peerEOF() {
 	}
 	c.mu.Unlock()
 	if cancel != nil {
-		cancel()
+		cancel.Cancel()
 	}
 	resourceChanged()
 }
@@ -90,7 +90,7 @@ func (c *Conn) cancelRequest() {
 	cancel := c.cancel
 	c.mu.Unlock()
 	if cancel != nil {
-		cancel()
+		cancel.Cancel()
 	}
 }
 

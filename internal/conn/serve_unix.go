@@ -223,7 +223,7 @@ func (c *Conn) serveRequest(in *bufio.Reader, out *bufio.Writer) bool {
 		http1.OnBodyReadDone(r, c.bodyReadDone)
 	}
 	if eof && r.Body == http.NoBody {
-		cancel()
+		cancel.Cancel()
 	}
 	readDeadline := time.Time{}
 	if c.engine.server.ReadTimeout > 0 {
@@ -249,7 +249,7 @@ func (c *Conn) serveRequest(in *bufio.Reader, out *bufio.Writer) bool {
 			h.ServeHTTP(w, r)
 		}
 	}
-	cancel()
+	cancel.Cancel()
 	c.mu.Lock()
 	c.cancel = nil
 	c.mu.Unlock()
