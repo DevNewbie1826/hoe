@@ -63,28 +63,29 @@ type Server struct {
 	// Nil follows net/http defaults.
 	Protocols *http.Protocols
 
-	once sync.Once
-	std  *http.Server
+	once       sync.Once
+	configured sync.Once
+	std        *http.Server
 }
 
 // ListenAndServe listens on s.Addr and serves s.Handler.
 // It always returns a non-nil error, including ErrServerClosed after shutdown.
-func (s *Server) ListenAndServe() error { return s.fallback().ListenAndServe() }
+func (s *Server) ListenAndServe() error { return s.serving().ListenAndServe() }
 
 // ListenAndServeTLS listens on s.Addr with TLS. Certificate files may be empty
 // when TLSConfig supplies certificates or GetCertificate.
 func (s *Server) ListenAndServeTLS(certFile, keyFile string) error {
-	return s.fallback().ListenAndServeTLS(certFile, keyFile)
+	return s.serving().ListenAndServeTLS(certFile, keyFile)
 }
 
 // Serve serves requests on l and closes l on return.
 // It always returns a non-nil error.
-func (s *Server) Serve(l net.Listener) error { return s.fallback().Serve(l) }
+func (s *Server) Serve(l net.Listener) error { return s.serving().Serve(l) }
 
 // ServeTLS serves TLS requests on l and closes l on return.
 // Certificate files may be empty when TLSConfig supplies certificates.
 func (s *Server) ServeTLS(l net.Listener, certFile, keyFile string) error {
-	return s.fallback().ServeTLS(l, certFile, keyFile)
+	return s.serving().ServeTLS(l, certFile, keyFile)
 }
 
 // Shutdown gracefully closes listeners and idle connections, waiting for

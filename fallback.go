@@ -10,6 +10,13 @@ func (s *Server) fallback() *http.Server {
 		if s.std == nil {
 			s.std = &http.Server{}
 		}
+	})
+	return s.std
+}
+
+func (s *Server) serving() *http.Server {
+	std := s.fallback()
+	s.configured.Do(func() {
 		// Assign configuration only; never copy http.Server's mutexes/state.
 		s.std.Addr = s.Addr
 		s.std.Handler = s.Handler
@@ -28,7 +35,7 @@ func (s *Server) fallback() *http.Server {
 		s.std.HTTP2 = s.HTTP2
 		s.std.Protocols = s.Protocols
 	})
-	return s.std
+	return std
 }
 
 // FromStd wraps s without copying its lifecycle state or registered callbacks.
