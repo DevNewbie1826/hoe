@@ -42,6 +42,7 @@ type Conn struct {
 	postPadding                 int
 	timerSlot                   int // guarded by wheel.mu
 	timerTick                   int64
+	timerArmed                  atomic.Bool
 }
 
 func (c *Conn) setState(s http.ConnState) {

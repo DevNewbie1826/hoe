@@ -35,6 +35,7 @@ func (w *deadlineWheel) update(c *Conn, t time.Time) {
 		delete(w.slots[c.timerSlot], c)
 		w.count--
 		c.timerSlot = -1
+		c.timerArmed.Store(false)
 	}
 	if !t.IsZero() && time.Now().Before(t) {
 		tick := (t.UnixNano() + int64(deadlineQuantum) - 1) / int64(deadlineQuantum)
@@ -44,6 +45,7 @@ func (w *deadlineWheel) update(c *Conn, t time.Time) {
 		}
 		w.slots[slot][c] = struct{}{}
 		c.timerSlot, c.timerTick = slot, tick
+		c.timerArmed.Store(true)
 		w.count++
 	}
 	w.mu.Unlock()
@@ -57,6 +59,9 @@ func (c *Conn) updateDeadlinesLocked() {
 	if c.changed != nil {
 		close(c.changed)
 		c.changed = nil
+	}
+	if c.readDeadline.IsZero() && c.writeDeadline.IsZero() && !c.timerArmed.Load() {
+		return
 	}
 	t := c.readDeadline
 	now := time.Now()
@@ -73,6 +78,9 @@ func (c *Conn) updateDeadlinesLocked() {
 func (c *Conn) SetDeadline(t time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.readDeadline.Equal(t) && c.writeDeadline.Equal(t) {
+		return nil
+	}
 	c.readDeadline, c.writeDeadline = t, t
 	c.updateDeadlinesLocked()
 	return nil
@@ -82,6 +90,9 @@ func (c *Conn) SetDeadline(t time.Time) error {
 func (c *Conn) SetReadDeadline(t time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.readDeadline.Equal(t) {
+		return nil
+	}
 	c.readDeadline = t
 	c.updateDeadlinesLocked()
 	return nil
@@ -91,6 +102,9 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 func (c *Conn) SetWriteDeadline(t time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.writeDeadline.Equal(t) {
+		return nil
+	}
 	c.writeDeadline = t
 	c.updateDeadlinesLocked()
 	return nil
@@ -116,7 +130,7 @@ func (c *Conn) startHead(idle bool) {
 	}
 	c.mu.Lock()
 	c.serving = false
-	if !idle {
+	if !idle && (c.engine.server.ReadTimeout > 0 || c.engine.server.ReadHeaderTimeout > 0) {
 		c.headStart = time.Now()
 	}
 	c.readDeadline = after(d)
@@ -166,6 +180,7 @@ func (w *deadlineWheel) run() {
 				if c.timerTick <= now {
 					delete(w.slots[t%deadlineSlots], c)
 					c.timerSlot = -1
+					c.timerArmed.Store(false)
 					w.count--
 					expired = append(expired, c)
 				}
