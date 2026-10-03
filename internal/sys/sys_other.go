@@ -16,3 +16,6 @@ func Sendfile(int, int, *int64, int) (int, error) { return 0, ErrUnsupported }
 
 // Splice reports an unsupported syscall.
 func Splice(int, int, int) (int, error) { return 0, ErrUnsupported }
+
+// SplicePipe reports an unsupported syscall.
+func SplicePipe() ([2]int, error) { return [2]int{}, ErrUnsupported }

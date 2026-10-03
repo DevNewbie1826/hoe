@@ -59,3 +59,6 @@ func sendfile(out, in int, offset *int64, count int) (int, error) {
 
 // Splice reports that Darwin has no splice syscall.
 func Splice(out, in, count int) (int, error) { return 0, ErrUnsupported }
+
+// SplicePipe reports that Darwin has no splice syscall.
+func SplicePipe() ([2]int, error) { return [2]int{}, ErrUnsupported }

@@ -43,6 +43,14 @@ func sendfile(out, in int, offset *int64, count int) (int, error) {
 	return syscall.Sendfile(out, in, offset, count)
 }
 
+// SplicePipe creates a nonblocking close-on-exec pipe for socket transfers.
+// The caller must close both descriptors after the transfer finishes.
+func SplicePipe() ([2]int, error) {
+	var fds [2]int
+	err := syscall.Pipe2(fds[:], syscall.O_NONBLOCK|syscall.O_CLOEXEC)
+	return fds, err
+}
+
 // Splice moves bytes between a socket and a pipe, or between pipes, without
 // blocking. At least one descriptor must be a pipe; callers own both ends.
 func Splice(out, in, count int) (int, error) {
