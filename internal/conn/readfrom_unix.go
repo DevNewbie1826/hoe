@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"reflect"
 	"time"
 
 	"github.com/DevNewbie1826/hoe/internal/bufpool"
@@ -22,12 +23,22 @@ func (c *Conn) ReadFrom(src io.Reader) (int64, error) {
 		limit = lr
 		raw = lr.R
 	}
-	f, ok := raw.(*os.File)
-	if !ok {
+	file := false
+	if _, ok := raw.(*os.File); ok {
+		file = true
+	} else if typ := reflect.TypeOf(raw); typ != nil {
+		file = typ.PkgPath() == "os" && typ.Name() == "fileWithoutWriteTo"
+	}
+	if !file {
 		b := bufpool.Get(32 << 10)
 		defer bufpool.Put(b)
 		return io.CopyBuffer(writeOnly{c}, src, b)
 	}
+	f := raw.(interface {
+		Stat() (os.FileInfo, error)
+		Seek(int64, int) (int64, error)
+		Fd() uintptr
+	})
 	info, err := f.Stat()
 	if err != nil {
 		return 0, err

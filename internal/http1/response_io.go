@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"reflect"
 	"strconv"
 	"time"
 )
@@ -169,7 +170,17 @@ func (w *Response) ReadFrom(src io.Reader) (n int64, err error) {
 	if lr, ok := raw.(*io.LimitedReader); ok {
 		raw = lr.R
 	}
-	if f, ok := raw.(*os.File); ok {
+	file := false
+	if _, ok := raw.(*os.File); ok {
+		file = true
+	} else if typ := reflect.TypeOf(raw); typ != nil {
+		file = typ.PkgPath() == "os" && typ.Name() == "fileWithoutWriteTo"
+	}
+	if file {
+		f := raw.(interface {
+			Stat() (os.FileInfo, error)
+			Seek(int64, int) (int64, error)
+		})
 		info, statErr := f.Stat()
 		if statErr != nil {
 			return 0, statErr
