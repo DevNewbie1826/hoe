@@ -28,7 +28,15 @@ func Writev(fd int, buffers [][]byte) (int, error) {
 		return 0, nil
 	}
 	writevCalls.Add(1)
-	count, _, errno := syscall.Syscall(syscall.SYS_WRITEV, uintptr(fd), uintptr(unsafe.Pointer(&vectors[0])), uintptr(n))
+	var count uintptr
+	var errno syscall.Errno
+	if runtime.GOOS == "linux" {
+		// Transport sockets are nonblocking; EAGAIN is handled by the
+		// adapter, so this call must not hand a P to the runtime scheduler.
+		count, _, errno = syscall.RawSyscall(syscall.SYS_WRITEV, uintptr(fd), uintptr(unsafe.Pointer(&vectors[0])), uintptr(n))
+	} else {
+		count, _, errno = syscall.Syscall(syscall.SYS_WRITEV, uintptr(fd), uintptr(unsafe.Pointer(&vectors[0])), uintptr(n))
+	}
 	runtime.KeepAlive(buffers)
 	if errno != 0 {
 		return 0, errno
