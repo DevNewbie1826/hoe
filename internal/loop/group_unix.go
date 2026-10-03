@@ -13,10 +13,9 @@ import (
 	"github.com/DevNewbie1826/hoe/internal/sched"
 )
 
-// Group owns a set of loops and an elastic scheduler.
+// Group owns a set of loops, each with its own elastic worker shard.
 type Group struct {
 	loops     []*reactor
-	pool      *sched.Pool
 	handler   Handler
 	next      atomic.Uint64
 	tokens    atomic.Uint64
@@ -34,17 +33,17 @@ func New(cfg Config) (*Group, error) {
 	if n == 0 {
 		n = DefaultLoops()
 	}
-	g := &Group{pool: sched.New(cfg.IdleWorkerTimeout), handler: cfg.Handler}
+	g := &Group{handler: cfg.Handler}
 	for range n {
 		p, err := poll.New()
 		if err != nil {
 			for _, l := range g.loops {
 				l.p.Close()
+				l.pool.Close()
 			}
-			g.pool.Close()
 			return nil, err
 		}
-		g.loops = append(g.loops, &reactor{g: g, p: p, done: make(chan struct{})})
+		g.loops = append(g.loops, &reactor{g: g, p: p, pool: sched.New(cfg.IdleWorkerTimeout), done: make(chan struct{})})
 	}
 	for _, l := range g.loops {
 		go l.run()
@@ -78,7 +77,9 @@ func (g *Group) Close() error {
 			<-l.done
 			g.closeErr = errors.Join(g.closeErr, l.err)
 		}
-		g.pool.Close()
+		for _, l := range g.loops {
+			l.pool.Close()
+		}
 	})
 	return g.closeErr
 }
@@ -121,6 +122,7 @@ type command struct {
 type reactor struct {
 	g        *Group
 	p        *poll.Poller
+	pool     *sched.Pool
 	table    []*entry
 	mu       sync.Mutex
 	commands []*command
@@ -175,7 +177,7 @@ func (l *reactor) callback(c *Conn, fn func()) {
 }
 func (l *reactor) dispatch() {
 	if len(l.tasks) != 0 {
-		l.g.pool.Dispatch(l.tasks)
+		l.pool.Dispatch(l.tasks)
 		clear(l.tasks)
 		l.tasks = l.tasks[:0]
 	}

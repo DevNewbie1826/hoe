@@ -219,13 +219,13 @@ func TestCloseVsEventFDReuse(t *testing.T) {
 func TestIdleConnectionsHoldNoBuffers(t *testing.T) {
 	before := bufpool.Outstanding()
 	h := &echoHandler{open: make(chan *Conn, 128), closed: make(chan *Conn, 128)}
-	g, addr := transport(t, h)
+	_, addr := transport(t, h)
 	for range 128 {
 		client := dial(t, addr)
 		owned := nextConn(t, h.open)
 		echo(t, client, "active-to-idle")
 		roundDone := make(chan struct{})
-		if !owned.queue.Submit(g.pool, func() { close(roundDone) }) {
+		if !owned.queue.Submit(owned.loop.pool, func() { close(roundDone) }) {
 			t.Fatal("round barrier rejected")
 		}
 		select {

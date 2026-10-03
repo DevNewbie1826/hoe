@@ -132,7 +132,7 @@ func TestReadinessStormCoalescesBlockedCallback(t *testing.T) {
 	h := &stormHandler{open: make(chan *Conn, 1), entered: make(chan struct{}), gate: make(chan struct{}), second: make(chan struct{})}
 	release := sync.OnceFunc(func() { close(h.gate) })
 	defer release()
-	g, addr := transport(t, h)
+	_, addr := transport(t, h)
 	client := dial(t, addr)
 	owned := nextConn(t, h.open)
 	if _, err := client.Write([]byte("start")); err != nil {
@@ -182,7 +182,7 @@ func TestReadinessStormCoalescesBlockedCallback(t *testing.T) {
 		t.Fatal("coalesced callback missing")
 	}
 	drained := make(chan struct{})
-	if !owned.queue.Submit(g.pool, func() { close(drained) }) {
+	if !owned.queue.Submit(owned.loop.pool, func() { close(drained) }) {
 		t.Fatal("queue barrier rejected")
 	}
 	select {
