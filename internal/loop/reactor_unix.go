@@ -7,6 +7,7 @@ import (
 	"net"
 	"syscall"
 
+	"github.com/DevNewbie1826/hoe/internal/poll"
 	"github.com/DevNewbie1826/hoe/internal/sys"
 )
 
@@ -32,6 +33,11 @@ func (l *reactor) run() {
 				continue
 			}
 			c := owner.conn
+			if h, ok := l.g.handler.(interface{ OnReadiness(*Conn, poll.Event) }); ok {
+				// This optional nonblocking hook cannot issue loop commands.
+				// Cancellation must not wait behind a blocked handler callback.
+				h.OnReadiness(c, e)
+			}
 			if c.noteEvent(e) {
 				l.callback(c, c.runEvents)
 			}
@@ -61,6 +67,13 @@ func (l *reactor) drain() bool {
 			err = net.ErrClosed
 		} else {
 			switch cmd.kind {
+			case stopListenersCommand:
+				for fd, e := range l.table {
+					if e != nil && e.conn == nil {
+						err = errors.Join(err, l.p.Delete(fd), syscall.Close(fd))
+						l.table[fd] = nil
+					}
+				}
 			case listenCommand:
 				if l.g.closed.Load() {
 					err = net.ErrClosed

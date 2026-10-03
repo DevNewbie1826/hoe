@@ -3,11 +3,15 @@ package hoe
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"log"
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/DevNewbie1826/hoe/internal/conn"
 )
 
 // ErrServerClosed is returned by serving methods after Shutdown or Close.
@@ -17,10 +21,9 @@ var ErrServerClosed = http.ErrServerClosed
 // Its zero value is ready to serve. Configure fields before starting serving;
 // do not copy a Server after first use.
 //
-// The future HTTP/1 engine has one compatibility exception: a MaxBytesReader
+// The HTTP/1 engine has one compatibility exception: a MaxBytesReader
 // kept only in a handler-local variable cannot signal connection closure.
 // Assign the wrapper to r.Body to preserve net/http's overflow-close behavior.
-// With the current standard-library delegation, even the local case matches.
 type Server struct {
 	// Addr is the TCP listening address; empty means ":http".
 	Addr string
@@ -63,14 +66,32 @@ type Server struct {
 	// Nil follows net/http defaults.
 	Protocols *http.Protocols
 
-	once       sync.Once
-	configured sync.Once
-	std        *http.Server
+	once        sync.Once
+	configured  sync.Once
+	std         *http.Server
+	mu          sync.Mutex
+	engines     map[*conn.Engine]struct{}
+	shutting    atomic.Bool
+	noKeepAlive atomic.Bool
+	usingEngine atomic.Bool
 }
 
 // ListenAndServe listens on s.Addr and serves s.Handler.
 // It always returns a non-nil error, including ErrServerClosed after shutdown.
-func (s *Server) ListenAndServe() error { return s.serving().ListenAndServe() }
+func (s *Server) ListenAndServe() error {
+	if s.shutting.Load() {
+		return ErrServerClosed
+	}
+	addr := s.Addr
+	if addr == "" {
+		addr = ":http"
+	}
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	return s.Serve(l)
+}
 
 // ListenAndServeTLS listens on s.Addr with TLS. Certificate files may be empty
 // when TLSConfig supplies certificates or GetCertificate.
@@ -80,7 +101,34 @@ func (s *Server) ListenAndServeTLS(certFile, keyFile string) error {
 
 // Serve serves requests on l and closes l on return.
 // It always returns a non-nil error.
-func (s *Server) Serve(l net.Listener) error { return s.serving().Serve(l) }
+func (s *Server) Serve(l net.Listener) error {
+	tcp, ok := l.(*net.TCPListener)
+	if !ok || !conn.Supported() || s.Protocols != nil && (s.Protocols.UnencryptedHTTP2() || !s.Protocols.HTTP1()) {
+		return s.serving().Serve(l)
+	}
+	defer l.Close()
+	s.mu.Lock()
+	if s.shutting.Load() {
+		s.mu.Unlock()
+		return ErrServerClosed
+	}
+	e, err := conn.New(s.serving(), tcp, func() bool { return !s.noKeepAlive.Load() && !s.shutting.Load() })
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	if s.engines == nil {
+		s.engines = make(map[*conn.Engine]struct{})
+	}
+	s.engines[e] = struct{}{}
+	s.usingEngine.Store(true)
+	s.mu.Unlock()
+	err = e.Serve(tcp)
+	if !errors.Is(err, ErrServerClosed) {
+		e.Close()
+	}
+	return err
+}
 
 // ServeTLS serves TLS requests on l and closes l on return.
 // Certificate files may be empty when TLSConfig supplies certificates.
@@ -90,15 +138,52 @@ func (s *Server) ServeTLS(l net.Listener, certFile, keyFile string) error {
 
 // Shutdown gracefully closes listeners and idle connections, waiting for
 // active handlers until ctx expires. Hijacked connections are not closed.
-func (s *Server) Shutdown(ctx context.Context) error { return s.fallback().Shutdown(ctx) }
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.shutting.Store(true)
+	err := s.fallback().Shutdown(ctx)
+	for _, e := range s.engineSnapshot() {
+		err = errors.Join(err, e.Shutdown(ctx))
+	}
+	return err
+}
 
 // Close immediately closes listeners and all non-hijacked connections.
-func (s *Server) Close() error { return s.fallback().Close() }
+func (s *Server) Close() error {
+	s.shutting.Store(true)
+	err := s.fallback().Close()
+	for _, e := range s.engineSnapshot() {
+		err = errors.Join(err, e.Close())
+	}
+	return err
+}
 
 // RegisterOnShutdown registers a nonblocking shutdown notification callback.
 func (s *Server) RegisterOnShutdown(f func()) { s.fallback().RegisterOnShutdown(f) }
 
 // SetKeepAlivesEnabled controls HTTP keep-alive; it is enabled by default.
-func (s *Server) SetKeepAlivesEnabled(v bool) { s.fallback().SetKeepAlivesEnabled(v) }
+func (s *Server) SetKeepAlivesEnabled(v bool) {
+	s.noKeepAlive.Store(!v)
+	s.fallback().SetKeepAlivesEnabled(v)
+	if !v {
+		for _, e := range s.engineSnapshot() {
+			e.CloseIdle()
+		}
+	}
+}
 
-func (s *Server) engineKind() string { return "std" }
+func (s *Server) engineKind() string {
+	if s.usingEngine.Load() {
+		return "event"
+	}
+	return "std"
+}
+
+func (s *Server) engineSnapshot() []*conn.Engine {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	es := make([]*conn.Engine, 0, len(s.engines))
+	for e := range s.engines {
+		es = append(es, e)
+	}
+	return es
+}

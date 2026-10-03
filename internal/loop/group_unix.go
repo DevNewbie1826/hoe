@@ -92,12 +92,23 @@ type commandKind uint8
 
 const (
 	listenCommand commandKind = iota
+	stopListenersCommand
 	adoptCommand
 	interestCommand
 	closeCommand
 	detachCommand
 	stopCommand
 )
+
+// CloseListeners stops accepting without closing active connections.
+// It is safe to call repeatedly, but not from a direct readiness callback.
+func (g *Group) CloseListeners() error {
+	var err error
+	for _, l := range g.loops {
+		err = errors.Join(err, l.call(&command{kind: stopListenersCommand}))
+	}
+	return err
+}
 
 type command struct {
 	kind        commandKind

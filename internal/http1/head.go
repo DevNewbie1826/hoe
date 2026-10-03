@@ -17,6 +17,7 @@ type requestBlock struct {
 	url     url.URL
 	values  [64]string
 	body    Body
+	context requestContext
 }
 
 // ParseHead parses a complete request head, including its terminating blank
@@ -33,8 +34,10 @@ func ParseHead(head []byte, body *bufio.Reader) (*http.Request, error) {
 	if err != nil {
 		return nil, err
 	}
-	attachBody(r, body, new(Body))
-	return r, nil
+	b := &requestBlock{request: *r}
+	b.attachContext()
+	attachBody(&b.request, body, &b.body)
+	return &b.request, nil
 }
 
 func fastHead(s string, in *bufio.Reader) *http.Request {
@@ -115,6 +118,7 @@ func fastHead(s string, in *bufio.Reader) *http.Request {
 	r.Close = hasToken(r.Header.Values("Connection"), "close") ||
 		(r.ProtoMinor == 0 && !hasToken(r.Header.Values("Connection"), "keep-alive"))
 	attachBody(r, in, &b.body)
+	b.attachContext()
 	return r
 }
 

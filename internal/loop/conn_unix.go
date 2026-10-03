@@ -109,6 +109,20 @@ func (c *Conn) Detach() (int, error) {
 	return c.fd, nil
 }
 
+// CloseWrite sends a FIN while allowing a bounded read drain before closure.
+func (c *Conn) CloseWrite() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return net.ErrClosed
+	}
+	return syscall.Shutdown(c.fd, syscall.SHUT_WR)
+}
+
+// RelinquishWorker releases scheduler ownership after Hijack or forced closure.
+// User code may continue blocking after its descriptor leaves the reactor.
+func (c *Conn) RelinquishWorker() { c.queue.Detach() }
+
 // LocalAddr returns a snapshot of the socket's local address.
 func (c *Conn) LocalAddr() (syscall.Sockaddr, error) {
 	c.mu.Lock()

@@ -32,6 +32,7 @@ type Body struct {
 	beforeRead   func() error
 	expectClosed atomic.Bool
 	expectEOF    atomic.Bool
+	readDone     func()
 }
 
 func attachBody(r *http.Request, in *bufio.Reader, b *Body) {
@@ -70,6 +71,11 @@ func (b *Body) Read(p []byte) (int, error) {
 }
 
 func (b *Body) readLocked(p []byte) (n int, err error) {
+	defer func() {
+		if err != nil && b.readDone != nil {
+			b.readDone()
+		}
+	}()
 	if b.sawEOF {
 		return 0, io.EOF
 	}
@@ -104,6 +110,14 @@ func (b *Body) readLocked(p []byte) (n int, err error) {
 		return n, io.EOF
 	}
 	return n, err
+}
+
+// OnBodyReadDone observes body EOF or a framing/read error without wrapping
+// Request.Body. It is installed before the handler is invoked.
+func OnBodyReadDone(r *http.Request, f func()) {
+	if b, ok := r.Body.(*Body); ok {
+		b.readDone = f
+	}
 }
 
 func (b *Body) readTrailer() error {

@@ -7,9 +7,10 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"testing"
 	"time"
+
+	"github.com/DevNewbie1826/hoe/internal/conn"
 )
 
 func TestConfigurationAfterLifecycleSetup(t *testing.T) {
@@ -79,10 +80,28 @@ func TestFromStdPreservesLifecycle(t *testing.T) {
 }
 
 func TestEngineInUse(t *testing.T) {
-	if os.Getenv("HOE_EXPECT_ENGINE") != "1" {
-		t.Skip("N1 delegates; N3 must remove the opt-in guard")
+	if !conn.Supported() {
+		t.Skip("documented standard-library fallback platform")
 	}
-	s := &Server{}
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "engine") })}
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(l) }()
+	defer func() { s.Close(); l.Close(); <-done }()
+	tr := &http.Transport{}
+	defer tr.CloseIdleConnections()
+	r, err := (&http.Client{Transport: tr, Timeout: 5 * time.Second}).Get("http://" + l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := io.ReadAll(r.Body)
+	r.Body.Close()
+	if err != nil || string(p) != "engine" {
+		t.Fatalf("body=%q err=%v", p, err)
+	}
 	if s.engineKind() == "std" {
 		t.Fatal("plaintext TCP still delegates to net/http; N3 engine required")
 	}

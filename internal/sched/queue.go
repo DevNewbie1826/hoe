@@ -9,6 +9,8 @@ type Queue struct {
 	tasks     []func()
 	head      int
 	scheduled bool
+	pool      *Pool
+	worker    *worker
 }
 
 // Submit accepts a task with exactly one scheduled worker per Queue.
@@ -29,7 +31,28 @@ func (q *Queue) submitLocked(p *Pool, task func()) {
 	q.tasks = append(q.tasks, task)
 	if !q.scheduled {
 		q.scheduled = true
-		p.submitLocked(q.run)
+		q.pool = p
+		q.worker = p.submitLocked(q.run)
+	}
+}
+
+// Detach transfers the running queue's worker to an external protocol owner.
+// The callback keeps running, but pool closure no longer waits for it and the
+// worker exits instead of rejoining the idle stack when the callback returns.
+// Call while the callback is running after its descriptor has left the reactor.
+func (q *Queue) Detach() {
+	q.mu.Lock()
+	p := q.pool
+	q.mu.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	w := q.worker
+	if q.scheduled && !w.external {
+		w.external = true
+		p.count--
+		p.wg.Done()
 	}
 }
 

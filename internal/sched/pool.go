@@ -7,8 +7,9 @@ import (
 )
 
 type worker struct {
-	work chan func()
-	idle bool
+	work     chan func()
+	idle     bool
+	external bool
 }
 
 // Pool runs unrelated tasks without a concurrency cap. Call Close to drain
@@ -51,30 +52,37 @@ func (p *Pool) SubmitBatch(tasks []func()) bool {
 	return true
 }
 
-func (p *Pool) submitLocked(task func()) {
+func (p *Pool) submitLocked(task func()) *worker {
 	if n := len(p.idle); n != 0 {
 		w := p.idle[n-1]
 		p.idle[n-1] = nil
 		p.idle = p.idle[:n-1]
 		w.idle = false
 		w.work <- task
-		return
+		return w
 	}
 	w := &worker{work: make(chan func(), 1)}
 	p.count++
 	p.wg.Add(1)
 	go p.run(w, task)
+	return w
 }
 
 func (p *Pool) run(w *worker, task func()) {
-	defer p.wg.Done()
-	defer func() { p.mu.Lock(); p.count--; p.mu.Unlock() }()
+	defer func() {
+		p.mu.Lock()
+		if !w.external {
+			p.count--
+			p.wg.Done()
+		}
+		p.mu.Unlock()
+	}()
 	timer := time.NewTimer(p.expiry)
 	defer timer.Stop()
 	for {
 		task()
 		p.mu.Lock()
-		if p.closed {
+		if p.closed || w.external {
 			p.mu.Unlock()
 			return
 		}

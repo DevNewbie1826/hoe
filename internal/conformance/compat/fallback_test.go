@@ -187,9 +187,6 @@ func TestFallbackUnixListener(t *testing.T) {
 }
 
 func TestEngineInUse(t *testing.T) {
-	if os.Getenv("HOE_EXPECT_ENGINE") != "1" {
-		t.Skip("N1 delegation; N3 must remove this opt-in guard")
-	}
 	writer := make(chan string, 1)
 	addr, _ := launch(t, true, &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writer <- reflect.TypeOf(w).String()
