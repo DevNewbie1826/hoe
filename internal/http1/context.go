@@ -10,6 +10,7 @@ import (
 type requestContext struct {
 	context.Context
 	response *Response
+	head     string
 }
 
 // AfterFunc attaches a callback through native cancellation without a watcher.

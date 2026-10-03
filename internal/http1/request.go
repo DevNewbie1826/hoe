@@ -157,7 +157,12 @@ func validateServerHead(head []byte, r *http.Request) error {
 	}
 	// Host is deleted by the public ReadRequest. Inspect the original field,
 	// including absolute-form requests whose URL authority overrides Host.
-	s := string(head)
+	var s string
+	if block, ok := r.Context().(*requestContext); ok && block.head != "" {
+		s = block.head
+	} else {
+		s = string(head)
+	}
 	_, headers, _ := strings.Cut(s, "\n")
 	haveHost := false
 	for line := range strings.SplitSeq(headers, "\n") {

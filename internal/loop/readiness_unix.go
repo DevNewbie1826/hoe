@@ -57,6 +57,9 @@ func (c *Conn) noteEvent(e poll.Event) bool {
 		return false
 	}
 	c.eventScheduled = true
+	if c.eventTask == nil {
+		c.eventTask = c.runEvents
+	}
 	return true
 }
 

@@ -39,7 +39,7 @@ func (l *reactor) run() {
 				h.OnReadiness(c, e)
 			}
 			if c.noteEvent(e) {
-				l.callback(c, c.runEvents)
+				l.callback(c, c.eventTask)
 			}
 		}
 		if l.drain() {

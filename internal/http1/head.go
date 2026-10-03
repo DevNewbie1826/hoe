@@ -75,6 +75,7 @@ func fastHead(s string, in *bufio.Reader) *http.Request {
 	r.URL.Path, r.URL.RawQuery, r.URL.ForceQuery = splitTarget(target)
 	r.Header = make(http.Header)
 	count := 0
+	haveHost := false
 	for {
 		line, rest, ok = strings.Cut(rest, "\r\n")
 		if !ok {
@@ -91,6 +92,14 @@ func fastHead(s string, in *bufio.Reader) *http.Request {
 			return nil
 		}
 		k = commonKey(k)
+		if k == "Host" {
+			if haveHost {
+				return nil
+			}
+			haveHost = true
+			r.Host = strings.Trim(v, " \t")
+			continue
+		}
 		if _, exists := r.Header[k]; exists {
 			return nil
 		}
@@ -102,8 +111,6 @@ func fastHead(s string, in *bufio.Reader) *http.Request {
 		r.Header[k] = b.values[count : count+1 : count+1]
 		count++
 	}
-	r.Host = r.Header.Get("Host")
-	delete(r.Header, "Host")
 	if v, exists := r.Header["Content-Length"]; exists {
 		n, err := strconv.ParseUint(v[0], 10, 63)
 		if err != nil {
@@ -119,6 +126,7 @@ func fastHead(s string, in *bufio.Reader) *http.Request {
 	r.Close = hasToken(r.Header.Values("Connection"), "close") ||
 		(r.ProtoMinor == 0 && !hasToken(r.Header.Values("Connection"), "keep-alive"))
 	attachBody(r, in, &b.body)
+	b.context.head = s
 	b.attachContext()
 	return r
 }

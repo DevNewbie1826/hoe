@@ -25,6 +25,7 @@ type Conn struct {
 	readReady, writeReady chan struct{}
 	pending               poll.Event
 	eventScheduled        bool
+	eventTask             func()
 }
 
 // Done closes as soon as the loop closes or detaches this descriptor, without

@@ -11,6 +11,7 @@ type Queue struct {
 	scheduled bool
 	pool      *Pool
 	worker    *worker
+	runTask   func()
 }
 
 // Submit accepts a task with exactly one scheduled worker per Queue.
@@ -32,7 +33,10 @@ func (q *Queue) submitLocked(p *Pool, task func()) {
 	if !q.scheduled {
 		q.scheduled = true
 		q.pool = p
-		q.worker = p.submitLocked(q.run)
+		if q.runTask == nil {
+			q.runTask = q.run
+		}
+		q.worker = p.submitLocked(q.runTask)
 	}
 }
 
