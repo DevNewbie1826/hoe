@@ -161,7 +161,15 @@ func (c *Conn) deadline(op string) (time.Time, <-chan struct{}) {
 
 func (c *Conn) wait(op string, ready <-chan struct{}) error {
 	for {
-		t, changed := c.deadline(op)
+		c.mu.Lock()
+		if c.changed == nil {
+			c.changed = make(chan struct{})
+		}
+		t, changed := c.readDeadline, c.changed
+		if op == "write" {
+			t = c.writeDeadline
+		}
+		c.mu.Unlock()
 		if !t.IsZero() && !time.Now().Before(t) {
 			return c.timeoutError(op)
 		}

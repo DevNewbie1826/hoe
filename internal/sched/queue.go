@@ -82,7 +82,7 @@ func (q *Queue) run() {
 	for {
 		q.mu.Lock()
 		if q.head == len(q.tasks) {
-			q.tasks = nil
+			q.tasks = q.tasks[:0]
 			q.head = 0
 			q.scheduled = false
 			q.mu.Unlock()

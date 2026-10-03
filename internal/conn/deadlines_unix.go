@@ -54,6 +54,10 @@ func (w *deadlineWheel) update(c *Conn, t time.Time) {
 }
 
 func (c *Conn) updateDeadlinesLocked() {
+	if c.changed != nil {
+		close(c.changed)
+		c.changed = nil
+	}
 	t := c.readDeadline
 	now := time.Now()
 	if !t.IsZero() && !now.Before(t) {
@@ -63,8 +67,6 @@ func (c *Conn) updateDeadlinesLocked() {
 		t = d
 	}
 	c.engine.timers.update(c, t)
-	close(c.changed)
-	c.changed = make(chan struct{})
 }
 
 // SetDeadline changes the blocking read and write deadlines.

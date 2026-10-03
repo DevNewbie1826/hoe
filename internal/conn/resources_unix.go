@@ -32,14 +32,18 @@ func trackEngine(e *Engine, add bool) {
 	} else {
 		delete(resources.engines, e)
 	}
-	close(resources.changed)
-	resources.changed = make(chan struct{})
+	if resources.changed != nil {
+		close(resources.changed)
+		resources.changed = nil
+	}
 	resources.Unlock()
 }
 func resourceChanged() {
 	resources.Lock()
-	close(resources.changed)
-	resources.changed = make(chan struct{})
+	if resources.changed != nil {
+		close(resources.changed)
+		resources.changed = nil
+	}
 	resources.Unlock()
 }
 
@@ -47,6 +51,9 @@ func resourceChanged() {
 func WatchResources() <-chan struct{} {
 	resources.Lock()
 	defer resources.Unlock()
+	if resources.changed == nil {
+		resources.changed = make(chan struct{})
+	}
 	return resources.changed
 }
 

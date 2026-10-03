@@ -11,8 +11,17 @@ import (
 )
 
 func (e *Engine) notifyLocked() {
-	close(e.changed)
-	e.changed = make(chan struct{})
+	if e.changed != nil {
+		close(e.changed)
+		e.changed = nil
+	}
+}
+
+func (e *Engine) watchLocked() <-chan struct{} {
+	if e.changed == nil {
+		e.changed = make(chan struct{})
+	}
+	return e.changed
 }
 
 // StopListening stops acceptance without interrupting active responses.
@@ -73,7 +82,7 @@ func (e *Engine) finalize() {
 	for {
 		e.mu.Lock()
 		empty := len(e.conns) == 0
-		change := e.changed
+		change := e.watchLocked()
 		e.mu.Unlock()
 		if empty {
 			e.closeResources(false)
@@ -98,7 +107,7 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 		for _, c := range e.conns {
 			cs = append(cs, c)
 		}
-		change := e.changed
+		change := e.watchLocked()
 		e.mu.Unlock()
 		if len(cs) == 0 {
 			return e.Close()
