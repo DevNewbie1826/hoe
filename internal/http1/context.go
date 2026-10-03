@@ -7,7 +7,10 @@ import (
 
 // requestContext lives in the immutable request allocation, not a connection
 // pool. Native cancellation retains Cause semantics and direct child attachment.
-type requestContext struct{ context.Context }
+type requestContext struct {
+	context.Context
+	response *Response
+}
 
 // AfterFunc attaches a callback through native cancellation without a watcher.
 func (c *requestContext) AfterFunc(f func()) func() bool {
@@ -16,6 +19,7 @@ func (c *requestContext) AfterFunc(f func()) func() bool {
 
 func (b *requestBlock) attachContext() {
 	b.context.Context = context.Background()
+	b.context.response = &b.response
 	b.request = *b.request.WithContext(&b.context)
 }
 

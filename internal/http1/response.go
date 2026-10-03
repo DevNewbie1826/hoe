@@ -40,17 +40,28 @@ type Response struct {
 	trailers         []string
 	err              error
 	buffer           *bufio.Writer
+	chunks           responseChunks
 	continueMu       sync.Mutex
 	continuePending  bool
 	expect           bool
 }
 
+var responseBufferPool = sync.Pool{New: func() any {
+	return bufio.NewWriterSize(io.Discard, 2048)
+}}
+
 // NewResponse binds a request to blocking, bounded transport I/O. transport
 // may implement io.ReaderFrom, deadline methods, CloseNotify, and the Hijack
 // hook described on Response.Hijack. No goroutine is started by the codec.
 func NewResponse(r *http.Request, in *bufio.Reader, out *bufio.Writer, transport io.Writer) *Response {
-	w := &Response{
-		req: r, in: in, out: out, transport: transport, header: make(http.Header),
+	var w *Response
+	if block, ok := r.Context().(*requestContext); ok {
+		w = block.response
+	} else {
+		w = new(Response)
+	}
+	*w = Response{
+		req: r, in: in, out: out, transport: transport,
 		contentLength: -1, wantsClose: r.Close,
 		wants10KeepAlive: r.ProtoMajor == 1 && r.ProtoMinor == 0 && hasToken(r.Header.Values("Connection"), "keep-alive"),
 	}
@@ -60,7 +71,9 @@ func NewResponse(r *http.Request, in *bufio.Reader, out *bufio.Writer, transport
 		// handler. Undeclared trailers must update that request, not its copy.
 		w.body.req = r
 	}
-	w.buffer = bufio.NewWriterSize(responseChunks{w}, 2048)
+	w.chunks.w = w
+	w.buffer = responseBufferPool.Get().(*bufio.Writer)
+	w.buffer.Reset(&w.chunks)
 	if w.body != nil && hasToken(r.Header.Values("Expect"), "100-continue") && r.ProtoAtLeast(1, 1) {
 		w.expect, w.continuePending = true, true
 		w.body.beforeRead = w.writeContinue
@@ -70,6 +83,9 @@ func NewResponse(r *http.Request, in *bufio.Reader, out *bufio.Writer, transport
 
 // Header returns the handler's mutable response headers.
 func (w *Response) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
 	if w.status != 0 && !w.wire && w.snapshot == nil {
 		w.snapshot = w.header.Clone()
 	}
@@ -158,6 +174,7 @@ func (w *Response) Finish() error {
 	if w.done {
 		return w.err
 	}
+	defer w.releaseBuffer()
 	w.detectLimit()
 	w.done = true
 	if w.status == 0 {
@@ -188,6 +205,14 @@ func (w *Response) Finish() error {
 		w.record(w.req.MultipartForm.RemoveAll())
 	}
 	return w.err
+}
+
+func (w *Response) releaseBuffer() {
+	if w.buffer != nil {
+		w.buffer.Reset(io.Discard)
+		responseBufferPool.Put(w.buffer)
+		w.buffer = nil
+	}
 }
 
 // CloseAfterReply reports whether the owner must stop HTTP reuse.

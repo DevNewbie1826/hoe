@@ -13,11 +13,12 @@ import (
 )
 
 type requestBlock struct {
-	request http.Request
-	url     url.URL
-	values  [64]string
-	body    Body
-	context requestContext
+	request  http.Request
+	url      url.URL
+	values   [64]string
+	body     Body
+	context  requestContext
+	response Response
 }
 
 // ParseHead parses a complete request head, including its terminating blank

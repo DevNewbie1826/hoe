@@ -11,12 +11,22 @@ import (
 	"net/http"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/DevNewbie1826/hoe/internal/bufpool"
 	"github.com/DevNewbie1826/hoe/internal/http1"
 )
+
+type requestIO struct {
+	in  *bufio.Reader
+	out *bufio.Writer
+}
+
+var requestIOPool = sync.Pool{New: func() any {
+	return &requestIO{bufio.NewReaderSize(nil, 4096), bufio.NewWriterSize(io.Discard, 4096)}
+}}
 
 func wouldBlock(err error) bool {
 	return errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK)
@@ -138,7 +148,15 @@ func (c *Conn) readHead() (bool, error) {
 }
 
 func (c *Conn) serveRequest() bool {
-	in, out := bufio.NewReaderSize(c, 4096), bufio.NewWriterSize(c, 4096)
+	buffers := requestIOPool.Get().(*requestIO)
+	in, out := buffers.in, buffers.out
+	in.Reset(c)
+	out.Reset(c)
+	defer func() {
+		in.Reset(nil)
+		out.Reset(io.Discard)
+		requestIOPool.Put(buffers)
+	}()
 	r, err := http1.ReadRequest(in, c.engine.server.MaxHeaderBytes)
 	if err != nil {
 		http1.WriteError(c, err)
@@ -146,7 +164,7 @@ func (c *Conn) serveRequest() bool {
 		return false
 	}
 	cancel := http1.BindContext(r, c.base)
-	r.RemoteAddr = c.remote.String()
+	r.RemoteAddr = c.remoteName
 	c.mu.Lock()
 	c.cancel = cancel
 	c.bodyDone = r.Body == http.NoBody
@@ -154,7 +172,9 @@ func (c *Conn) serveRequest() bool {
 	c.serving = true
 	eof := c.eof
 	c.mu.Unlock()
-	http1.OnBodyReadDone(r, c.bodyReadDone)
+	if r.Body != http.NoBody {
+		http1.OnBodyReadDone(r, c.bodyReadDone)
+	}
 	if eof && r.Body == http.NoBody {
 		cancel()
 	}

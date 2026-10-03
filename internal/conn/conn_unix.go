@@ -22,6 +22,7 @@ type Conn struct {
 	engine                      *Engine
 	raw                         *loop.Conn
 	local, remote               *net.TCPAddr
+	remoteName                  string
 	base                        context.Context
 	state                       atomic.Int32
 	mu                          sync.Mutex

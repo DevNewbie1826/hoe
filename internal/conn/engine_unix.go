@@ -108,6 +108,7 @@ func (e *Engine) OnOpen(raw *loop.Conn) {
 		return
 	}
 	c := &Conn{engine: e, raw: raw, local: tcpAddr(local), remote: tcpAddr(remote), changed: make(chan struct{}), timerSlot: -1}
+	c.remoteName = c.remote.String()
 	c.accepted = time.Now()
 	c.base = e.base
 	if e.server.ConnContext != nil {

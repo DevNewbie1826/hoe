@@ -127,6 +127,7 @@ func (w *Response) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 		conn, rw, err := c.Hijack(w.in)
 		if err == nil {
 			w.hijacked = true
+			w.releaseBuffer()
 		}
 		return conn, rw, err
 	}
@@ -135,6 +136,7 @@ func (w *Response) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 			return nil, nil, err
 		}
 		w.hijacked = true
+		w.releaseBuffer()
 		return c, bufio.NewReadWriter(w.in, w.out), nil
 	}
 	return nil, nil, http.ErrNotSupported
