@@ -28,6 +28,12 @@ var requestIOPool = sync.Pool{New: func() any {
 	return &requestIO{bufio.NewReaderSize(nil, 4096), bufio.NewWriterSize(io.Discard, 4096)}
 }}
 
+var corkWriterPool = sync.Pool{New: func() any {
+	return bufio.NewWriterSize(io.Discard, 64<<10)
+}}
+
+const maxPendingOutput = 64 << 20
+
 func wouldBlock(err error) bool {
 	return errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK)
 }
@@ -38,6 +44,21 @@ func completeHead(p []byte) bool {
 }
 
 func (c *Conn) round() {
+	var buffers *requestIO
+	var in *bufio.Reader
+	var out *bufio.Writer
+	corked := false
+	defer func() {
+		if buffers != nil {
+			in.Reset(nil)
+			out.Reset(io.Discard)
+			if corked {
+				corkWriterPool.Put(out)
+				c.engine.pendingOutput.Add(-(64 << 10))
+			}
+			requestIOPool.Put(buffers)
+		}
+	}()
 	defer func() {
 		if p := recover(); p != nil {
 			if p != http.ErrAbortHandler {
@@ -57,7 +78,28 @@ func (c *Conn) round() {
 			return
 		default:
 		}
-		ready, err := c.readHead()
+		ready := false
+		if in != nil && in.Buffered() > 0 {
+			p, _ := in.Peek(in.Buffered())
+			ready = completeHead(p)
+			if ready {
+				c.startHead(false)
+				c.setState(http.StateActive)
+			} else {
+				c.readMu.Lock()
+				b := bufpool.Get(max(4096, len(p)+len(c.input)-c.offset))
+				n := copy(b, p)
+				n += copy(b[n:], c.input[c.offset:])
+				c.releaseInputLocked()
+				c.input = b[:n]
+				c.readMu.Unlock()
+				in.Discard(len(p))
+			}
+		}
+		var err error
+		if !ready {
+			ready, err = c.readHead()
+		}
 		if err != nil {
 			if writeErr := http1.WriteError(c, err); writeErr != nil {
 				c.cancelRequest()
@@ -74,7 +116,21 @@ func (c *Conn) round() {
 		if !ready {
 			return
 		}
-		if !c.serveRequest() {
+		if buffers == nil {
+			buffers = requestIOPool.Get().(*requestIO)
+			in, out = buffers.in, buffers.out
+			// Reserve cork capacity, not only bytes already pending. When
+			// the server budget is full, retain std's 4KiB blocking path.
+			corked = c.engine.pendingOutput.Add(64<<10) <= maxPendingOutput
+			if corked {
+				out = corkWriterPool.Get().(*bufio.Writer)
+			} else {
+				c.engine.pendingOutput.Add(-(64 << 10))
+			}
+			in.Reset(c)
+			out.Reset(c)
+		}
+		if !c.serveRequest(in, out) {
 			return
 		}
 	}
@@ -147,16 +203,7 @@ func (c *Conn) readHead() (bool, error) {
 	}
 }
 
-func (c *Conn) serveRequest() bool {
-	buffers := requestIOPool.Get().(*requestIO)
-	in, out := buffers.in, buffers.out
-	in.Reset(c)
-	out.Reset(c)
-	defer func() {
-		in.Reset(nil)
-		out.Reset(io.Discard)
-		requestIOPool.Put(buffers)
-	}()
+func (c *Conn) serveRequest(in *bufio.Reader, out *bufio.Writer) bool {
 	r, err := http1.ReadRequest(in, c.engine.server.MaxHeaderBytes)
 	if err != nil {
 		http1.WriteError(c, err)
@@ -214,18 +261,21 @@ func (c *Conn) serveRequest() bool {
 		c.Close()
 		return false
 	}
-	if n := in.Buffered(); n > 0 {
-		p, _ := in.Peek(n)
-		c.readMu.Lock()
-		b := bufpool.Get(n + len(c.input) - c.offset)
-		copy(b, p)
-		copy(b[n:], c.input[c.offset:])
-		c.releaseInputLocked()
-		c.input = b
-		c.readMu.Unlock()
-	}
 	if r.Method == "POST" {
 		c.postPadding = 4
+		// The shared round reader may own leading padding/pipeline bytes.
+		if in.Buffered() > 0 {
+			p, _ := in.Peek(in.Buffered())
+			n := 0
+			for n < len(p) && c.postPadding > 0 && (p[n] == '\r' || p[n] == '\n') {
+				n++
+				c.postPadding--
+			}
+			in.Discard(n)
+			if in.Buffered() > 0 {
+				c.postPadding = 0
+			}
+		}
 	}
 	c.startHead(true)
 	c.setState(http.StateIdle)

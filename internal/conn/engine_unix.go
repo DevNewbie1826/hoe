@@ -27,6 +27,7 @@ type Engine struct {
 	conns           map[*loop.Conn]*Conn
 	changed         chan struct{}
 	stopping        atomic.Bool
+	pendingOutput   atomic.Int64
 	stopOnce        sync.Once
 	stopped         chan struct{}
 	closeOnce       sync.Once
