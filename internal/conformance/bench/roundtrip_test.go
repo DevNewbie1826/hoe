@@ -23,14 +23,18 @@ type server interface {
 }
 
 func launch(t testing.TB, own bool, h http.Handler) (string, server) {
+	return launchConfig(t, own, &http.Server{Handler: h})
+}
+
+func launchConfig(t testing.TB, own bool, cfg *http.Server) (string, server) {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var s server = &http.Server{Handler: h}
+	var s server = cfg
 	if own {
-		s = &hoe.Server{Handler: h}
+		s = &hoe.Server{Handler: cfg.Handler, ConnContext: cfg.ConnContext, ConnState: cfg.ConnState}
 	}
 	done := make(chan error, 1)
 	go func() { done <- s.Serve(l) }()

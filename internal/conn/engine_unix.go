@@ -109,7 +109,6 @@ func (e *Engine) OnOpen(raw *loop.Conn) {
 		return
 	}
 	c := &Conn{engine: e, raw: raw, local: tcpAddr(local), remote: tcpAddr(remote), changed: make(chan struct{}), timerSlot: -1}
-	c.remoteName = c.remote.String()
 	c.accepted = time.Now()
 	c.base = e.base
 	if e.server.ConnContext != nil {
@@ -124,6 +123,8 @@ func (e *Engine) OnOpen(raw *loop.Conn) {
 	e.notifyLocked()
 	e.mu.Unlock()
 	c.setState(http.StateNew)
+	// Like std conn.serve, snapshot after ConnContext and StateNew hooks.
+	c.remoteName = c.remote.String()
 	c.startHead(false)
 	if e.stopping.Load() {
 		c.Close()
