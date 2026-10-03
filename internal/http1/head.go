@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unsafe"
 )
 
 type requestBlock struct {
@@ -19,6 +20,7 @@ type requestBlock struct {
 	body     Body
 	context  requestContext
 	response Response
+	headData [512]byte
 }
 
 // ParseHead parses a complete request head, including its terminating blank
@@ -28,20 +30,31 @@ type requestBlock struct {
 // Uncommon heads use http.ReadRequest; ordinary requests share one block for
 // their Request, URL, header values, and body state.
 func ParseHead(head []byte, body *bufio.Reader) (*http.Request, error) {
-	if r := fastHead(string(head), body); r != nil {
+	b := new(requestBlock)
+	var owned string
+	if len(head) <= len(b.headData) {
+		copy(b.headData[:], head)
+		// The bytes belong to this fresh, never-pooled request allocation.
+		// They are never changed after publication; retained URL/header
+		// strings keep the containing allocation alive.
+		owned = unsafe.String(&b.headData[0], len(head))
+	} else {
+		owned = string(head)
+	}
+	if r := fastHead(owned, body, b); r != nil {
 		return r, nil
 	}
 	r, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(head)))
 	if err != nil {
 		return nil, err
 	}
-	b := &requestBlock{request: *r}
+	b.request = *r
 	b.attachContext()
 	attachBody(&b.request, body, &b.body)
 	return &b.request, nil
 }
 
-func fastHead(s string, in *bufio.Reader) *http.Request {
+func fastHead(s string, in *bufio.Reader, b *requestBlock) *http.Request {
 	line, rest, ok := strings.Cut(s, "\r\n")
 	if !ok {
 		return nil
@@ -64,7 +77,6 @@ func fastHead(s string, in *bufio.Reader) *http.Request {
 			return nil
 		}
 	}
-	b := new(requestBlock)
 	r := &b.request
 	r.Method, r.RequestURI, r.Proto = internMethod(method), target, proto
 	r.ProtoMajor, r.ProtoMinor = 1, 1
