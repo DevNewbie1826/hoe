@@ -18,8 +18,6 @@ type registration struct {
 // Poller is owned by one loop. Only Wake may run concurrently.
 type Poller struct {
 	backend
-	file   *os.File
-	raw    syscall.RawConn
 	regs   map[int]*registration
 	tokens map[uint64]*registration
 	out    []Event
@@ -27,26 +25,13 @@ type Poller struct {
 	closed bool
 }
 
-// New opens a kernel poller and registers it with Go's network poller.
+// New opens an edge-triggered kernel poller. Linux registers the epoll
+// descriptor with Go's network poller; Darwin uses a blocking kqueue wait.
 func New() (*Poller, error) {
 	p := &Poller{regs: make(map[int]*registration), tokens: make(map[uint64]*registration), out: make([]Event, 0, MaxEvents)}
 	if err := p.open(); err != nil {
 		return nil, err
 	}
-	file, err := p.pollFile()
-	if err != nil {
-		p.closeFDs()
-		syscall.Close(p.fd)
-		return nil, err
-	}
-	p.file = file
-	raw, err := p.file.SyscallConn()
-	if err != nil {
-		p.closeFDs()
-		p.file.Close()
-		return nil, err
-	}
-	p.raw = raw
 	return p, nil
 }
 
@@ -98,23 +83,13 @@ func (p *Poller) Delete(fd int) error {
 	return nil
 }
 
-// Wait parks until readiness or a wake; events live until the next Wait.
+// Wait waits until readiness or a wake; events live until the next Wait.
+// Linux parks through syscall.RawConn.Read without blocking an OS thread.
+// Darwin blocks the owner in kevent until readiness or an EVFILT_USER wake.
 func (p *Poller) Wait() ([]Event, error) {
-	var n int
-	var waitErr error
-	err := p.raw.Read(func(uintptr) bool {
-		n, waitErr = p.waitReady()
-		if errors.Is(waitErr, syscall.EINTR) {
-			waitErr = nil
-			return false
-		}
-		return n > 0 || waitErr != nil
-	})
+	n, err := p.wait()
 	if err != nil {
 		return nil, err
-	}
-	if waitErr != nil {
-		return nil, waitErr
 	}
 	p.out = p.out[:0]
 	if err := p.collect(n); err != nil {
@@ -141,5 +116,5 @@ func (p *Poller) Close() error {
 		return nil
 	}
 	p.closed = true
-	return errors.Join(p.closeFDs(), p.file.Close())
+	return p.closeFDs()
 }

@@ -12,13 +12,8 @@ import (
 type backend struct {
 	fd, wake int
 	events   [MaxEvents]syscall.EpollEvent
-}
-
-func (p *Poller) pollFile() (*os.File, error) {
-	if err := syscall.SetNonblock(p.fd, true); err != nil {
-		return nil, err
-	}
-	return os.NewFile(uintptr(p.fd), "hoe-epoll"), nil
+	file     *os.File
+	raw      syscall.RawConn
 }
 
 func (p *Poller) open() error {
@@ -38,6 +33,18 @@ func (p *Poller) open() error {
 		syscall.Close(fd)
 		return err
 	}
+	if err := syscall.SetNonblock(fd, true); err != nil {
+		syscall.Close(p.wake)
+		syscall.Close(fd)
+		return err
+	}
+	p.file = os.NewFile(uintptr(fd), "hoe-epoll")
+	raw, err := p.file.SyscallConn()
+	if err != nil {
+		p.closeFDs()
+		return err
+	}
+	p.raw = raw
 	return nil
 }
 
@@ -61,6 +68,23 @@ func (p *Poller) remove(r *registration) error {
 	return syscall.EpollCtl(p.fd, syscall.EPOLL_CTL_DEL, r.fd, nil)
 }
 func (p *Poller) waitReady() (int, error) { return syscall.EpollWait(p.fd, p.events[:], 0) }
+
+func (p *Poller) wait() (int, error) {
+	var n int
+	var waitErr error
+	err := p.raw.Read(func(uintptr) bool {
+		n, waitErr = p.waitReady()
+		if errors.Is(waitErr, syscall.EINTR) {
+			waitErr = nil
+			return false
+		}
+		return n > 0 || waitErr != nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return n, waitErr
+}
 
 func (p *Poller) collect(n int) error {
 	for _, e := range p.events[:n] {
@@ -104,4 +128,4 @@ func (p *Poller) signal() error {
 		return err
 	}
 }
-func (p *Poller) closeFDs() error { return syscall.Close(p.wake) }
+func (p *Poller) closeFDs() error { return errors.Join(syscall.Close(p.wake), p.file.Close()) }

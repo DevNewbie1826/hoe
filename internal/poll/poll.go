@@ -1,4 +1,7 @@
 // Package poll provides edge-triggered readiness notifications.
+// Linux parks the epoll descriptor in Go's runtime network poller and wakes
+// through eventfd. Darwin blocks the owning loop goroutine in kevent and wakes
+// through EVFILT_USER; it uses no pipe or relay goroutine.
 package poll
 
 import "errors"

@@ -4,58 +4,16 @@ package poll
 
 import (
 	"errors"
-	"os"
 	"syscall"
 	"unsafe"
 )
 
 type backend struct {
-	fd                      int
-	pipe                    [2]int
-	events                  [MaxEvents]syscall.Kevent_t
-	notifyFD, notifyWriteFD int
-	notifyWriter            *os.File
-	results                 chan kqueueResult
-	begin                   chan struct{}
-	requested               bool
-	stop                    chan struct{}
-	joined                  chan struct{}
+	fd     int
+	events [MaxEvents]syscall.Kevent_t
 	// kqueue stores Go pointer values, but does not own references for the GC.
 	// Retain deleted registrations until all events from the next wait resolve.
 	retired []*registration
-}
-
-func (p *Poller) pollFile() (*os.File, error) {
-	// XNU does not expose kqueue as a nonblocking file. One helper waits
-	// in kevent and relays batches to this runtime-polled pipe. There are
-	// no per-connection waiters, and Close joins the helper.
-	r, w, err := os.Pipe()
-	if err != nil {
-		return nil, err
-	}
-	for _, target := range []struct {
-		file *os.File
-		fd   *int
-	}{{r, &p.notifyFD}, {w, &p.notifyWriteFD}} {
-		raw, err := target.file.SyscallConn()
-		if err != nil {
-			r.Close()
-			w.Close()
-			return nil, err
-		}
-		if err := raw.Control(func(fd uintptr) { *target.fd = int(fd) }); err != nil {
-			r.Close()
-			w.Close()
-			return nil, err
-		}
-	}
-	p.notifyWriter = w
-	p.results = make(chan kqueueResult, 1)
-	p.begin = make(chan struct{}, 1)
-	p.stop = make(chan struct{})
-	p.joined = make(chan struct{})
-	go p.relay()
-	return r, nil
 }
 
 func (p *Poller) open() error {
@@ -69,23 +27,10 @@ func (p *Poller) open() error {
 		return err
 	}
 	p.fd = fd
-	if err := syscall.Pipe(p.pipe[:]); err != nil {
-		syscall.Close(fd)
-		return err
-	}
-	for _, fd := range p.pipe {
-		syscall.CloseOnExec(fd)
-		if err := syscall.SetNonblock(fd, true); err != nil {
-			p.closeFDs()
-			syscall.Close(p.fd)
-			return err
-		}
-	}
-	ev := syscall.Kevent_t{Ident: uint64(p.pipe[0]), Filter: syscall.EVFILT_READ, Flags: syscall.EV_ADD | syscall.EV_CLEAR}
+	ev := syscall.Kevent_t{Ident: 1, Filter: syscall.EVFILT_USER, Flags: syscall.EV_ADD | syscall.EV_CLEAR}
 	_, err = syscall.Kevent(p.fd, []syscall.Kevent_t{ev}, nil, nil)
 	if err != nil {
 		p.closeFDs()
-		syscall.Close(p.fd)
 	}
 	return err
 }
@@ -118,44 +63,18 @@ func (p *Poller) remove(r *registration) error {
 	return result
 }
 
-func (p *Poller) waitReady() (int, error) {
-	if !p.requested {
-		p.requested = true
-		p.begin <- struct{}{}
+func (p *Poller) wait() (int, error) {
+	for {
+		n, err := syscall.Kevent(p.fd, nil, p.events[:], nil)
+		if !errors.Is(err, syscall.EINTR) {
+			return n, err
+		}
 	}
-	var b [1]byte
-	n, err := syscall.Read(p.notifyFD, b[:])
-	if errors.Is(err, syscall.EAGAIN) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-	if n == 0 {
-		return 0, os.ErrClosed
-	}
-	result := <-p.results
-	copy(p.events[:], result.events)
-	p.requested = false
-	return len(result.events), result.err
 }
 
 func (p *Poller) collect(n int) error {
 	for _, e := range p.events[:n] {
-		if int(e.Ident) == p.pipe[0] {
-			var b [256]byte
-			for {
-				_, err := syscall.Read(p.pipe[0], b[:])
-				if errors.Is(err, syscall.EINTR) {
-					continue
-				}
-				if errors.Is(err, syscall.EAGAIN) {
-					break
-				}
-				if err != nil {
-					return err
-				}
-			}
+		if e.Filter == syscall.EVFILT_USER {
 			continue
 		}
 		if e.Udata == nil {
@@ -177,25 +96,13 @@ func (p *Poller) collect(n int) error {
 }
 
 func (p *Poller) signal() error {
+	ev := syscall.Kevent_t{Ident: 1, Filter: syscall.EVFILT_USER, Fflags: syscall.NOTE_TRIGGER}
 	for {
-		_, err := syscall.Write(p.pipe[1], []byte{1})
+		_, err := syscall.Kevent(p.fd, []syscall.Kevent_t{ev}, nil, nil)
 		if errors.Is(err, syscall.EINTR) {
 			continue
-		}
-		if errors.Is(err, syscall.EAGAIN) {
-			return nil
 		}
 		return err
 	}
 }
-func (p *Poller) closeFDs() error {
-	var err error
-	if p.stop != nil {
-		close(p.stop)
-		err = p.signal()
-		<-p.joined
-		err = errors.Join(err, p.notifyWriter.Close())
-		err = errors.Join(err, syscall.Close(p.fd))
-	}
-	return errors.Join(err, syscall.Close(p.pipe[0]), syscall.Close(p.pipe[1]))
-}
+func (p *Poller) closeFDs() error { return syscall.Close(p.fd) }
