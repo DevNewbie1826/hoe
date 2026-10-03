@@ -2,11 +2,11 @@ package http1
 
 import (
 	"bufio"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -22,7 +22,10 @@ func (c responseChunks) Write(p []byte) (int, error) {
 		return 0, w.err
 	}
 	if w.chunked {
-		if _, err := fmt.Fprintf(w.out, "%x\r\n", len(p)); err != nil {
+		var scratch [18]byte
+		frame := strconv.AppendInt(scratch[:0], int64(len(p)), 16)
+		frame = append(frame, '\r', '\n')
+		if _, err := w.out.Write(frame); err != nil {
 			w.record(err)
 			return 0, err
 		}

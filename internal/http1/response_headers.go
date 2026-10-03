@@ -7,24 +7,33 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 var dateCache struct {
 	sync.Mutex
+	current atomic.Pointer[dateValue]
+}
+
+type dateValue struct {
 	second int64
 	value  string
 }
 
 func cachedDate() string {
-	now := time.Now()
+	second := time.Now().Unix()
+	if value := dateCache.current.Load(); value != nil && value.second == second {
+		return value.value
+	}
 	dateCache.Lock()
 	defer dateCache.Unlock()
-	if now.Unix() != dateCache.second {
-		dateCache.second = now.Unix()
-		dateCache.value = now.UTC().Format(http.TimeFormat)
+	value := dateCache.current.Load()
+	if value == nil || value.second != second {
+		value = &dateValue{second, time.Unix(second, 0).UTC().Format(http.TimeFormat)}
+		dateCache.current.Store(value)
 	}
-	return dateCache.value
+	return value.value
 }
 
 func (w *Response) sendHead(p []byte) {
@@ -143,7 +152,13 @@ func (w *Response) sendHead(p []byte) {
 	w.record(h.WriteSubset(w.out, exclude))
 	for _, field := range [][2]string{{"Date", date}, {"Content-Length", length}, {"Content-Type", contentType}, {"Connection", connection}, {"Transfer-Encoding", transfer}} {
 		if field[1] != "" {
-			_, err := fmt.Fprintf(w.out, "%s: %s\r\n", field[0], field[1])
+			_, err := w.out.WriteString(field[0])
+			w.record(err)
+			_, err = w.out.WriteString(": ")
+			w.record(err)
+			_, err = w.out.WriteString(field[1])
+			w.record(err)
+			_, err = w.out.WriteString("\r\n")
 			w.record(err)
 		}
 	}
@@ -160,7 +175,14 @@ func writeStatus(out *bufio.Writer, is11 bool, status int) {
 	if text == "" {
 		text = fmt.Sprintf("status code %d", status)
 	}
-	fmt.Fprintf(out, "%s %03d %s\r\n", version, status, text)
+	out.WriteString(version)
+	out.WriteByte(' ')
+	out.WriteByte(byte('0' + status/100))
+	out.WriteByte(byte('0' + status/10%10))
+	out.WriteByte(byte('0' + status%10))
+	out.WriteByte(' ')
+	out.WriteString(text)
+	out.WriteString("\r\n")
 }
 
 func validTrailer(k string) bool {
