@@ -1,0 +1,8 @@
+# local-only notes and agent state (not uploaded)
+docs/
+.omo/
+
+# build output
+/bin/
+*.test
+*.out
