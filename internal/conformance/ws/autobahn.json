@@ -1,0 +1,11 @@
+{
+  "outdir": "/reports",
+  "servers": [
+    {"agent": "hoe/websocket", "url": "ws://server:9001"},
+    {"agent": "gorilla-over-hoe", "url": "ws://server:9002"},
+    {"agent": "gorilla-over-std", "url": "ws://server:9003"}
+  ],
+  "cases": ["1.*", "2.*", "3.*", "4.*", "5.*", "6.*", "7.*", "8.*", "9.*", "10.*", "12.*", "13.*"],
+  "exclude-cases": [],
+  "exclude-agent-cases": {}
+}
