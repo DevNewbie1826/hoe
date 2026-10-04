@@ -77,6 +77,12 @@ func fastHead(s string, in *bufio.Reader, b *requestBlock) *http.Request {
 			return nil
 		}
 	}
+	path, query, force := splitTarget(target)
+	// Std preserves RawPath when raw path bytes differ from canonical escaping.
+	// Query bytes do not affect RawPath; the star target is a special std case.
+	if path != "*" && strings.ContainsAny(path, "!\"'()*<>[\\]^`{|}") {
+		return nil
+	}
 	r := &b.request
 	r.Method, r.RequestURI, r.Proto = internMethod(method), target, proto
 	r.ProtoMajor, r.ProtoMinor = 1, 1
@@ -84,7 +90,7 @@ func fastHead(s string, in *bufio.Reader, b *requestBlock) *http.Request {
 		r.ProtoMinor = 0
 	}
 	r.URL = &b.url
-	r.URL.Path, r.URL.RawQuery, r.URL.ForceQuery = splitTarget(target)
+	r.URL.Path, r.URL.RawQuery, r.URL.ForceQuery = path, query, force
 	r.Header = make(http.Header)
 	count := 0
 	haveHost := false
