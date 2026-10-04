@@ -25,7 +25,7 @@ type requestIO struct {
 }
 
 var requestIOPool = sync.Pool{New: func() any {
-	return &requestIO{bufio.NewReaderSize(nil, 4096), bufio.NewWriterSize(io.Discard, 4096)}
+	return &requestIO{in: bufio.NewReaderSize(nil, 4096)}
 }}
 
 var corkWriterPool = sync.Pool{New: func() any {
@@ -126,6 +126,10 @@ func (c *Conn) round() {
 				out = corkWriterPool.Get().(*bufio.Writer)
 			} else {
 				c.engine.pendingOutput.Add(-(64 << 10))
+				if out == nil {
+					out = bufio.NewWriterSize(io.Discard, 4096)
+					buffers.out = out
+				}
 			}
 			in.Reset(c)
 			out.Reset(c)
