@@ -16,11 +16,11 @@ import (
 type requestBlock struct {
 	request  http.Request
 	url      url.URL
-	values   [64]string
+	values   [8]string
 	body     Body
 	context  requestContext
 	response Response
-	headData [512]byte
+	headData [128]byte
 }
 
 // ParseHead parses a complete request head, including its terminating blank
