@@ -204,3 +204,56 @@ func TestReviewTransportOptionsLimitPipeline(t *testing.T) {
 		}
 	}
 }
+
+func TestReviewTransportServeSetupErrors(t *testing.T) {
+	for _, shutdown := range []bool{false, true} {
+		for _, own := range []bool{false, true} {
+			t.Run(fmt.Sprintf("shutdown=%t/hoe=%t", shutdown, own), func(t *testing.T) {
+				// Given either a closed listener or a server already shut down.
+				l, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer l.Close()
+				var s server = &http.Server{}
+				if own {
+					s = hoeConfig(&http.Server{})
+				}
+				defer s.Close()
+				want := net.ErrClosed
+				if shutdown {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					err = s.Shutdown(ctx)
+					cancel()
+					want = http.ErrServerClosed
+				} else {
+					err = l.Close()
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				beforeFD, beforeBuffers := fdCount(t), bufpool.Outstanding()
+				before := engineconn.SnapshotResources()
+				// When Serve encounters the terminal setup state.
+				err = s.Serve(l)
+				// Then its error identity matches std and cleanup joins resources.
+				if !errors.Is(err, want) || errors.Is(err, http.ErrServerClosed) != shutdown {
+					t.Fatalf("Serve=%v want=%v", err, want)
+				}
+				if err = s.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if own && (bufpool.Outstanding() != beforeBuffers || engineconn.SnapshotResources() != before) {
+					t.Fatal("setup failure leaked engine resources")
+				}
+				afterFD := fdCount(t)
+				if shutdown {
+					beforeFD-- // Serve closes the initially open listener.
+				}
+				if afterFD != beforeFD {
+					t.Fatalf("setup failure fds=%d want=%d", afterFD, beforeFD)
+				}
+			})
+		}
+	}
+}
