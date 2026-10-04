@@ -62,6 +62,17 @@ func (g *Group) Listen(fd int) error {
 	return g.owner().call(&command{kind: listenCommand, fd: fd})
 }
 
+// Adopt takes ownership of an accepted nonblocking close-on-exec socket.
+// It closes the descriptor even if registration fails.
+func (g *Group) Adopt(fd int) error {
+	c := &Conn{loop: g.owner(), fd: fd, token: g.tokens.Add(1), done: make(chan struct{})}
+	cmd := &command{kind: adoptCommand, conn: c, reply: make(chan error, 1)}
+	if err := c.loop.enqueue(cmd); err != nil {
+		return errors.Join(err, syscall.Close(fd))
+	}
+	return <-cmd.reply
+}
+
 // Close closes owned descriptors and joins loops and workers. It must not
 // be called from a Handler callback. Conn.Done closes before OnClose is queued,
 // so blocking adapters can release their workers during shutdown.

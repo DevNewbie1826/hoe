@@ -23,6 +23,7 @@ type Engine struct {
 	keepAlive       func() bool
 	base            context.Context
 	group           *loop.Group
+	listener        *net.TCPListener
 	mu              sync.Mutex
 	conns           map[*loop.Conn]*Conn
 	changed         chan struct{}
@@ -55,45 +56,56 @@ func New(s *http.Server, l *net.TCPListener, keepAlive func() bool) (*Engine, er
 		return nil, err
 	}
 	e.group = g
+	e.listener = l
 	go e.timers.run()
 	trackEngine(e, true)
 	go e.finalize()
 	return e, nil
 }
 
-// Serve transfers a duplicate listener descriptor to the loops and closes l.
+// Serve accepts on the caller's listener and transfers sockets to the loops.
 // It returns when acceptance stops, independently of active request completion.
 func (e *Engine) Serve(l *net.TCPListener) error {
-	f, err := l.File()
-	if err != nil {
-		return err
+	defer e.StopListening()
+	for {
+		c, err := l.AcceptTCP()
+		if err != nil {
+			if e.stopping.Load() {
+				return http.ErrServerClosed
+			}
+			return err
+		}
+		raw, err := c.SyscallConn()
+		if err != nil {
+			c.Close()
+			return err
+		}
+		fd := -1
+		var dupErr error
+		err = raw.Control(func(socket uintptr) {
+			// Dup preserves the accepted socket's nonblocking flag. Unlike
+			// TCPConn.File, it never changes the runtime-owned file status.
+			syscall.ForkLock.RLock()
+			defer syscall.ForkLock.RUnlock()
+			fd, dupErr = syscall.Dup(int(socket))
+			if dupErr == nil {
+				syscall.CloseOnExec(fd)
+			}
+		})
+		closeErr := c.Close()
+		if err = errors.Join(err, dupErr, closeErr); err != nil {
+			if fd >= 0 {
+				syscall.Close(fd)
+			}
+			return err
+		}
+		if err = e.group.Adopt(fd); err != nil {
+			if e.stopping.Load() {
+				return http.ErrServerClosed
+			}
+			return err
+		}
 	}
-	fd, err := syscall.Dup(int(f.Fd()))
-	closeErr := f.Close()
-	if err != nil {
-		return errors.Join(err, closeErr)
-	}
-	if closeErr != nil {
-		syscall.Close(fd)
-		return closeErr
-	}
-	syscall.CloseOnExec(fd)
-	if err = syscall.SetNonblock(fd, true); err != nil {
-		syscall.Close(fd)
-		return err
-	}
-	if err = e.group.Listen(fd); err != nil {
-		syscall.Close(fd)
-		return err
-	}
-	if err = l.Close(); err != nil {
-		return err
-	}
-	if e.stopping.Load() {
-		e.group.CloseListeners()
-	}
-	<-e.stopped
-	return http.ErrServerClosed
 }
 
 // OnOpen creates the stable net.Conn identity and context chain.

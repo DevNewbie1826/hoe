@@ -40,7 +40,8 @@ func wouldBlock(err error) bool {
 func interrupted(err error) bool { return errors.Is(err, syscall.EINTR) }
 
 func completeHead(p []byte) bool {
-	return bytes.Contains(p, []byte("\r\n\r\n")) || bytes.Contains(p, []byte("\n\n"))
+	// Match the codec's headEnd: an LF followed by an LF or CRLF.
+	return bytes.Contains(p, []byte("\n\n")) || bytes.Contains(p, []byte("\n\r\n"))
 }
 
 func (c *Conn) round() {
@@ -247,7 +248,8 @@ func (c *Conn) serveRequest(in *bufio.Reader, out *bufio.Writer) bool {
 		if r.Method == "OPTIONS" && r.RequestURI == "*" && !c.engine.server.DisableGeneralOptionsHandler {
 			w.Header().Set("Content-Length", "0")
 			if r.Body != http.NoBody {
-				io.CopyN(io.Discard, r.Body, 4096)
+				r.Body = http.MaxBytesReader(w, r.Body, 4096)
+				io.Copy(io.Discard, r.Body)
 			}
 		} else {
 			h.ServeHTTP(w, r)

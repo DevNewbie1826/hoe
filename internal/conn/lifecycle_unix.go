@@ -29,7 +29,10 @@ func (e *Engine) StopListening() error {
 	var err error
 	e.stopOnce.Do(func() {
 		e.stopping.Store(true)
-		err = e.group.CloseListeners()
+		err = e.listener.Close()
+		if errors.Is(err, net.ErrClosed) {
+			err = nil
+		}
 		close(e.stopped)
 	})
 	return err

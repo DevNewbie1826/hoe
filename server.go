@@ -124,7 +124,7 @@ func (s *Server) Serve(l net.Listener) error {
 	s.usingEngine.Store(true)
 	s.mu.Unlock()
 	err = e.Serve(tcp)
-	if !errors.Is(err, ErrServerClosed) {
+	if !errors.Is(err, ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 		e.Close()
 	}
 	return err
