@@ -46,10 +46,16 @@ func (w *Response) writeContinue() error {
 		return nil
 	}
 	w.continuePending = false
+	if err := w.pushPipeline(); err != nil {
+		return err
+	}
 	if _, err := w.out.WriteString("HTTP/1.1 100 Continue\r\n\r\n"); err != nil {
 		return err
 	}
-	return w.out.Flush()
+	if err := w.out.Flush(); err != nil {
+		return err
+	}
+	return w.pushPipeline()
 }
 
 func (w *Response) disableContinue(skip bool) {
@@ -72,13 +78,22 @@ func (w *Response) FlushError() error {
 	if w.hijacked {
 		return http.ErrHijacked
 	}
+	w.record(w.pushPipeline())
 	if w.status == 0 {
 		w.WriteHeader(200)
 	}
 	w.record(w.buffer.Flush())
 	w.sendHead(nil)
 	w.record(w.out.Flush())
+	w.record(w.pushPipeline())
 	return w.err
+}
+
+func (w *Response) pushPipeline() error {
+	if c, ok := w.transport.(interface{ PushPipeline() error }); ok {
+		return c.PushPipeline()
+	}
+	return nil
 }
 
 // EnableFullDuplex suppresses the pre-response request-body drain.

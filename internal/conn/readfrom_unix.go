@@ -21,6 +21,9 @@ type writeOnly struct{ io.Writer }
 // ReadFrom retains the standard file-copy special path over the loop socket.
 // The codec calls it only after sniffing and flushing an unchunked response.
 func (c *Conn) ReadFrom(src io.Reader) (int64, error) {
+	if err := c.PushPipeline(); err != nil {
+		return 0, err
+	}
 	raw := src
 	var limit *io.LimitedReader
 	if lr, ok := src.(*io.LimitedReader); ok {

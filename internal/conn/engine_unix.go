@@ -21,6 +21,7 @@ import (
 type Engine struct {
 	server          *http.Server
 	keepAlive       func() bool
+	pipelineDelay   time.Duration
 	base            context.Context
 	group           *loop.Group
 	listener        *net.TCPListener
@@ -41,7 +42,7 @@ type Engine struct {
 
 // New prepares a TCP engine using the standard server configuration snapshot.
 // The supplied keepAlive predicate includes shutdown and runtime policy.
-func New(s *http.Server, l *net.TCPListener, keepAlive func() bool) (*Engine, error) {
+func New(s *http.Server, l *net.TCPListener, policy Policy) (*Engine, error) {
 	base := context.Background()
 	if s.BaseContext != nil {
 		base = s.BaseContext(l)
@@ -49,7 +50,11 @@ func New(s *http.Server, l *net.TCPListener, keepAlive func() bool) (*Engine, er
 			panic("BaseContext returned a nil context")
 		}
 	}
-	e := &Engine{server: s, keepAlive: keepAlive, base: context.WithValue(base, http.ServerContextKey, s),
+	delay := policy.PipelineFlushDelay
+	if delay == 0 {
+		delay = time.Millisecond
+	}
+	e := &Engine{server: s, keepAlive: policy.KeepAlive, pipelineDelay: delay, base: context.WithValue(base, http.ServerContextKey, s),
 		conns: make(map[*loop.Conn]*Conn), changed: make(chan struct{}), stopped: make(chan struct{}), finalized: make(chan struct{}), resourcesClosed: make(chan struct{})}
 	e.timers.init()
 	g, err := loop.New(loop.Config{Handler: e, IdleWorkerTimeout: time.Second})
@@ -195,6 +200,7 @@ func (e *Engine) OnClose(raw *loop.Conn, cause error) {
 	if c == nil {
 		return
 	}
+	c.endPipelineLifetime()
 	c.cancelRequest()
 	c.releaseInput()
 	c.stopDeadlines()

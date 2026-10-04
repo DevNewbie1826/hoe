@@ -73,6 +73,7 @@ func (c *Conn) round() {
 			c.Close()
 		}
 	}()
+	defer c.endPipelineRound()
 	for {
 		select {
 		case <-c.raw.Done():
@@ -105,6 +106,10 @@ func (c *Conn) round() {
 			if writeErr := http1.WriteError(c, err); writeErr != nil {
 				c.cancelRequest()
 			}
+			if pushErr := c.PushPipeline(); pushErr != nil {
+				c.Close()
+				return
+			}
 			if c.raw.CloseWrite() == nil {
 				// A FIN makes the error readable even if rejected bytes remain
 				// in the socket. Wait for peer EOF, bounded like std's linger.
@@ -117,7 +122,8 @@ func (c *Conn) round() {
 		if !ready {
 			return
 		}
-		if buffers == nil {
+		first := buffers == nil
+		if first {
 			buffers = requestIOPool.Get().(*requestIO)
 			in, out = buffers.in, buffers.out
 			// Reserve cork capacity, not only bytes already pending. When
@@ -135,7 +141,7 @@ func (c *Conn) round() {
 			in.Reset(c)
 			out.Reset(c)
 		}
-		if !c.serveRequest(in, out) {
+		if !c.serveRequest(in, out, first) {
 			return
 		}
 	}
@@ -208,12 +214,24 @@ func (c *Conn) readHead() (bool, error) {
 	}
 }
 
-func (c *Conn) serveRequest(in *bufio.Reader, out *bufio.Writer) bool {
+func (c *Conn) serveRequest(in *bufio.Reader, out *bufio.Writer, first bool) bool {
 	r, err := http1.ReadRequest(in, c.engine.server.MaxHeaderBytes)
 	if err != nil {
 		http1.WriteError(c, err)
 		c.Close()
 		return false
+	}
+	// Only hold a round when another complete head is already buffered.
+	// Skip a known-length body; chunked bodies have no known next-head offset.
+	// Eligibility is checked once, so a release never re-corks this round.
+	if first && r.ContentLength >= 0 && r.ContentLength < int64(in.Buffered()) {
+		p, _ := in.Peek(in.Buffered())
+		if completeHead(p[r.ContentLength:]) {
+			if err := c.beginPipeline(); err != nil {
+				c.Close()
+				return false
+			}
+		}
 	}
 	cancel := http1.BindContext(r, c.base)
 	r.RemoteAddr = c.remoteName
@@ -263,6 +281,9 @@ func (c *Conn) serveRequest(in *bufio.Reader, out *bufio.Writer) bool {
 		return false
 	}
 	err = w.Finish()
+	if err == nil {
+		err = c.finishPipelineResponse()
+	}
 	if err != nil || w.CloseAfterReply() || !c.engine.keepAlive() {
 		c.Close()
 		return false

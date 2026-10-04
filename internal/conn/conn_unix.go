@@ -4,6 +4,7 @@ package conn
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -43,6 +44,8 @@ type Conn struct {
 	timerSlot                   int // guarded by wheel.mu
 	timerTick                   int64
 	timerArmed                  atomic.Bool
+	pipelineHooks               PipelineHooks
+	pipeline                    pipelineHold
 }
 
 func (c *Conn) setState(s http.ConnState) {
@@ -98,7 +101,8 @@ func (c *Conn) cancelRequest() {
 // Close asks the owner loop to close the descriptor.
 func (c *Conn) Close() error {
 	c.cancelRequest()
-	return c.raw.Close()
+	err := c.endPipelineLifetime()
+	return errors.Join(err, c.raw.Close())
 }
 
 // LocalAddr returns the immutable local TCP address snapshot.
@@ -162,6 +166,9 @@ func (c *Conn) deadline(op string) (time.Time, <-chan struct{}) {
 }
 
 func (c *Conn) wait(op string, ready <-chan struct{}) error {
+	if err := c.PushPipeline(); err != nil {
+		return err
+	}
 	for {
 		c.mu.Lock()
 		if c.changed == nil {
@@ -249,7 +256,7 @@ func (c *Conn) Write(p []byte) (int, error) {
 			return total, c.timeoutError("write")
 		}
 		ready := c.raw.WriteReady()
-		n, err := c.raw.Writev([][]byte{p})
+		n, err := c.pipelineWrite(p)
 		total += n
 		p = p[n:]
 		if interrupted(err) {
