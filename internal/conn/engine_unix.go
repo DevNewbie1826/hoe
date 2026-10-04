@@ -120,6 +120,7 @@ func (e *Engine) OnOpen(raw *loop.Conn) {
 	c.base = context.WithValue(c.base, http.LocalAddrContextKey, c.local)
 	e.mu.Lock()
 	e.conns[raw] = c
+	raw.Data.Store(c)
 	e.notifyLocked()
 	e.mu.Unlock()
 	c.setState(http.StateNew)
@@ -132,9 +133,8 @@ func (e *Engine) OnOpen(raw *loop.Conn) {
 }
 
 func (e *Engine) lookup(raw *loop.Conn) *Conn {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.conns[raw]
+	c, _ := raw.Data.Load().(*Conn)
+	return c
 }
 
 // OnReadiness signals disconnect directly, even while ServeHTTP is blocked.

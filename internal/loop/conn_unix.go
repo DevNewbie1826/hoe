@@ -5,6 +5,7 @@ package loop
 import (
 	"net"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/DevNewbie1826/hoe/internal/poll"
@@ -15,6 +16,8 @@ import (
 // Conn identifies one lifetime of an accepted descriptor. It retains no I/O
 // buffer while idle. Its I/O lock prevents close or detach during a syscall.
 type Conn struct {
+	// Data publishes the handler's lifetime attachment, once, during OnOpen.
+	Data                  atomic.Value
 	loop                  *reactor
 	fd                    int
 	token                 uint64
