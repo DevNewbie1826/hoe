@@ -43,6 +43,15 @@ func (*Conn) Sendfile(int, *int64, int) (int, error) { return 0, poll.ErrUnsuppo
 // Splice reports an unsupported platform.
 func (*Conn) Splice(int, int) (int, error) { return 0, poll.ErrUnsupported }
 
+// EnableCork is a no-op on standard-server fallback platforms.
+func (*Conn) EnableCork() error { return nil }
+
+// PushCork is a no-op on standard-server fallback platforms.
+func (*Conn) PushCork(bool) error { return nil }
+
+// CorkEnabled reports no cork on standard-server fallback platforms.
+func (*Conn) CorkEnabled() (bool, error) { return false, nil }
+
 // SetInterest reports an unsupported platform.
 func (*Conn) SetInterest(bool, bool) error { return poll.ErrUnsupported }
 

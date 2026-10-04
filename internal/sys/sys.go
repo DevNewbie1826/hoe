@@ -9,7 +9,7 @@ import (
 // ErrUnsupported reports an unavailable syscall.
 var ErrUnsupported = errors.New("hoe: unsupported syscall")
 
-// Counters records attempted zero-copy/vector calls and transferred bytes.
+// Counters records attempted transport calls and transferred bytes.
 type Counters struct {
 	// SendfileCalls counts attempted nonempty sendfile syscalls.
 	SendfileCalls uint64
@@ -21,14 +21,24 @@ type Counters struct {
 	SpliceBytes uint64
 	// WritevCalls counts attempted nonempty writev syscalls.
 	WritevCalls uint64
+	// PushCalls counts explicit kernel cork push attempts, not enable/probe calls.
+	PushCalls uint64
 }
 
 var sendfileCalls, sendfileBytes, spliceCalls, spliceBytes, writevCalls atomic.Uint64
+var pushCalls atomic.Uint64
 
 // SnapshotCounters reads process-wide syscall accounting.
 // Concurrent snapshots may span transfers; quiesce to compare exact totals.
 func SnapshotCounters() Counters {
-	return Counters{sendfileCalls.Load(), sendfileBytes.Load(), spliceCalls.Load(), spliceBytes.Load(), writevCalls.Load()}
+	return Counters{
+		SendfileCalls: sendfileCalls.Load(),
+		SendfileBytes: sendfileBytes.Load(),
+		SpliceCalls:   spliceCalls.Load(),
+		SpliceBytes:   spliceBytes.Load(),
+		WritevCalls:   writevCalls.Load(),
+		PushCalls:     pushCalls.Load(),
+	}
 }
 
 // ResetCounters resets accounting; callers must quiesce transfers first.
@@ -38,4 +48,5 @@ func ResetCounters() {
 	spliceCalls.Store(0)
 	spliceBytes.Store(0)
 	writevCalls.Store(0)
+	pushCalls.Store(0)
 }
