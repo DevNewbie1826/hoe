@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200" role="img" aria-labelledby="t">
+  <title id="t">Pickaxe</title>
+  <defs>
+    <clipPath id="tile"><rect width="200" height="200" rx="44"/></clipPath>
+  </defs>
+  <rect width="200" height="200" rx="44" fill="#e78a2e"/>
+  <g clip-path="url(#tile)">
+    <ellipse cx="62" cy="34" rx="120" ry="72" fill="#ffffff" opacity="0.08"/>
+  </g>
+  <g transform="rotate(45 100 100)">
+    <path d="M26 70 Q62 26 100 40 Q138 26 174 70" fill="none" stroke="#96a8b3" stroke-width="12" stroke-linecap="round" transform="translate(0 4)"/>
+    <path d="M26 70 Q62 26 100 40 Q138 26 174 70" fill="none" stroke="#d6dfe5" stroke-width="12" stroke-linecap="round"/>
+    <rect x="90" y="54" width="20" height="18" rx="4" fill="#5f6b76"/>
+    <rect x="93.5" y="66" width="13" height="118" rx="6.5" fill="#8a5a2b"/>
+    <rect x="97" y="76" width="3.6" height="100" rx="1.8" fill="#a4713a"/>
+    <rect x="92" y="176" width="16" height="10" rx="5" fill="#6e4423"/>
+  </g>
+</svg>
