@@ -60,6 +60,7 @@ func verifyBody(t testing.TB, raw, want []byte, method string) {
 	if err != nil || !bytes.Equal(got, want) {
 		t.Fatalf("body bytes=%d want=%d err=%v status=%d", len(got), len(want), err, r.StatusCode)
 	}
+	t.Logf("HTTP status=%d headers=%v body_bytes=%d body_prefix=%q", r.StatusCode, r.Header, len(got), got[:min(32, len(got))])
 }
 
 func TestSendfileUsed(t *testing.T) {
@@ -198,6 +199,8 @@ func BenchmarkFileCopy(b *testing.B) {
 			c.SetDeadline(time.Now().Add(time.Minute))
 			in := bufio.NewReader(c)
 			b.SetBytes(int64(len(data)))
+			before := systest.Snapshot()
+			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				if _, err := io.WriteString(c, get); err != nil {
@@ -212,6 +215,12 @@ func BenchmarkFileCopy(b *testing.B) {
 				if err != nil || !bytes.Equal(p, data) {
 					b.Fatal("invalid file response", err)
 				}
+			}
+			b.StopTimer()
+			if own {
+				after := systest.Snapshot()
+				b.ReportMetric(float64(after.SendfileCalls-before.SendfileCalls)/float64(b.N), "sendfile_calls/op")
+				b.ReportMetric(float64(after.SendfileBytes-before.SendfileBytes)/float64(b.N), "sendfile_bytes/op")
 			}
 		})
 	}

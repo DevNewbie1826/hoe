@@ -39,27 +39,37 @@ func rawResponse(t testing.TB, addr, request string) []byte {
 }
 
 func TestCorkedResponseUsesOneWritev(t *testing.T) {
-	// Given: multiple writes totaling 32KiB, below the bounded cork watermark.
-	data := strings.Repeat("x", 32<<10)
-	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-		for start := 0; start < len(data); start += 4096 {
-			io.WriteString(w, data[start:start+4096])
-		}
-	})
-	std, _ := launch(t, false, h)
-	own, _ := launch(t, true, h)
-	request := "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"
-	want := rawResponse(t, std, request)
-	before := systest.Snapshot()
-	// When: the real event engine emits the complete response.
-	got := rawResponse(t, own, request)
-	// Then: byte-identical output was corked into one kernel vector write.
-	if !bytes.Equal(want, got) {
-		t.Fatal("corked response differs from std")
-	}
-	if calls := systest.Snapshot().WritevCalls - before.WritevCalls; calls != 1 {
-		t.Fatalf("writev calls=%d, want one", calls)
+	for _, framing := range []string{"length", "chunked"} {
+		t.Run(framing, func(t *testing.T) {
+			// Given: multiple writes totaling 32KiB, below the cork watermark.
+			data := strings.Repeat("x", 32<<10)
+			h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if framing == "length" {
+					w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				} else {
+					w.Header().Set("Transfer-Encoding", "chunked")
+				}
+				for start := 0; start < len(data); start += 4096 {
+					io.WriteString(w, data[start:start+4096])
+				}
+			})
+			std, _ := launch(t, false, h)
+			own, _ := launch(t, true, h)
+			request := "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"
+			want := rawResponse(t, std, request)
+			before := systest.Snapshot()
+			// When: the real event engine emits the complete response.
+			got := rawResponse(t, own, request)
+			// Then: byte-identical framing used one kernel vector write.
+			if !bytes.Equal(want, got) {
+				t.Fatal("corked response differs from std")
+			}
+			verifyBody(t, got, []byte(data), "GET")
+			if calls := systest.Snapshot().WritevCalls - before.WritevCalls; calls != 1 {
+				t.Fatalf("writev calls=%d, want one", calls)
+			}
+			t.Log("SAME framing, body validated, writev=1")
+		})
 	}
 }
 
