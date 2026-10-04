@@ -67,14 +67,31 @@ func New(s *http.Server, l *net.TCPListener, keepAlive func() bool) (*Engine, er
 // It returns when acceptance stops, independently of active request completion.
 func (e *Engine) Serve(l *net.TCPListener) error {
 	defer e.StopListening()
+	var tempDelay time.Duration
 	for {
 		c, err := l.AcceptTCP()
 		if err != nil {
 			if e.stopping.Load() {
 				return http.ErrServerClosed
 			}
+			var temporary net.Error
+			if errors.As(err, &temporary) && temporary.Temporary() {
+				if tempDelay == 0 {
+					tempDelay = 5 * time.Millisecond
+				} else {
+					tempDelay = min(tempDelay*2, time.Second)
+				}
+				if logger := e.server.ErrorLog; logger != nil {
+					logger.Printf("http: Accept error: %v; retrying in %v", err, tempDelay)
+				} else {
+					e.serverLog("http: Accept error: %v; retrying in %v", err, tempDelay)
+				}
+				time.Sleep(tempDelay)
+				continue
+			}
 			return err
 		}
+		tempDelay = 0
 		raw, err := c.SyscallConn()
 		if err != nil {
 			c.Close()
