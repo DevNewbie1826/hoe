@@ -21,9 +21,13 @@ var ErrServerClosed = http.ErrServerClosed
 // Its zero value is ready to serve. Configure fields before starting serving;
 // do not copy a Server after first use.
 //
-// The HTTP/1 engine has one compatibility exception: a MaxBytesReader
-// kept only in a handler-local variable cannot signal connection closure.
-// Assign the wrapper to r.Body to preserve net/http's overflow-close behavior.
+// The HTTP/1 engine has two owner-approved compatibility exceptions, both
+// for a MaxBytesReader that is not reachable from the served Request.Body:
+// one kept only in a handler-local variable, and one installed on a copied
+// request by http.MaxBytesHandler. After such an overflow the response and
+// error match net/http, but the connection stays reusable instead of closing
+// when at most 256 KiB of the body remains unread. Assign the wrapper to
+// r.Body to preserve net/http's overflow-close behavior.
 type Server struct {
 	// Addr is the TCP listening address; empty means ":http".
 	Addr string
