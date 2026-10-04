@@ -26,9 +26,15 @@ func (e *Engine) watchLocked() <-chan struct{} {
 
 // StopListening stops acceptance without interrupting active responses.
 func (e *Engine) StopListening() error {
+	e.stopping.Store(true)
+	return e.stopAcceptance()
+}
+
+// stopAcceptance also handles caller listener closure without requesting
+// shutdown of sockets which have already been accepted.
+func (e *Engine) stopAcceptance() error {
 	var err error
 	e.stopOnce.Do(func() {
-		e.stopping.Store(true)
 		err = e.listener.Close()
 		if errors.Is(err, net.ErrClosed) {
 			err = nil
@@ -36,6 +42,13 @@ func (e *Engine) StopListening() error {
 		close(e.stopped)
 	})
 	return err
+}
+
+func (e *Engine) finishOpen() {
+	e.mu.Lock()
+	e.opening--
+	e.notifyLocked()
+	e.mu.Unlock()
 }
 
 // Close cancels requests, closes HTTP descriptors, and joins owned goroutines.
@@ -84,7 +97,7 @@ func (e *Engine) finalize() {
 	<-e.stopped
 	for {
 		e.mu.Lock()
-		empty := len(e.conns) == 0
+		empty := len(e.conns) == 0 && e.opening == 0
 		change := e.watchLocked()
 		e.mu.Unlock()
 		if empty {
@@ -110,9 +123,10 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 		for _, c := range e.conns {
 			cs = append(cs, c)
 		}
+		empty := len(cs) == 0 && e.opening == 0
 		change := e.watchLocked()
 		e.mu.Unlock()
-		if len(cs) == 0 {
+		if empty {
 			return e.Close()
 		}
 		for _, c := range cs {

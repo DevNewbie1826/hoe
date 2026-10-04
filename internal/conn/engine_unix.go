@@ -26,6 +26,7 @@ type Engine struct {
 	listener        *net.TCPListener
 	mu              sync.Mutex
 	conns           map[*loop.Conn]*Conn
+	opening         int // guarded by mu; adopted sockets awaiting OnOpen completion
 	changed         chan struct{}
 	stopping        atomic.Bool
 	pendingOutput   atomic.Int64
@@ -66,7 +67,7 @@ func New(s *http.Server, l *net.TCPListener, keepAlive func() bool) (*Engine, er
 // Serve accepts on the caller's listener and transfers sockets to the loops.
 // It returns when acceptance stops, independently of active request completion.
 func (e *Engine) Serve(l *net.TCPListener) error {
-	defer e.StopListening()
+	defer e.stopAcceptance()
 	var tempDelay time.Duration
 	for {
 		c, err := l.AcceptTCP()
@@ -116,7 +117,11 @@ func (e *Engine) Serve(l *net.TCPListener) error {
 			}
 			return err
 		}
+		e.mu.Lock()
+		e.opening++
+		e.mu.Unlock()
 		if err = e.group.Adopt(fd); err != nil {
+			e.finishOpen()
 			if e.stopping.Load() {
 				return http.ErrServerClosed
 			}
@@ -127,6 +132,7 @@ func (e *Engine) Serve(l *net.TCPListener) error {
 
 // OnOpen creates the stable net.Conn identity and context chain.
 func (e *Engine) OnOpen(raw *loop.Conn) {
+	defer e.finishOpen()
 	local, err := raw.LocalAddr()
 	if err != nil {
 		raw.Close()
