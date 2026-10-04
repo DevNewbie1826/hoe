@@ -18,7 +18,7 @@ type Engine struct{}
 func Supported() bool { return false }
 
 // New reports an unsupported event engine platform.
-func New(*http.Server, *net.TCPListener, func() bool) (*Engine, error) {
+func New(*http.Server, *net.TCPListener, Policy) (*Engine, error) {
 	return nil, poll.ErrUnsupported
 }
 

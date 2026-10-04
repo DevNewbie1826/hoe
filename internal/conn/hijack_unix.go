@@ -22,6 +22,9 @@ func (logWriter) Write(p []byte) (int, error) { log.Print(string(p)); return len
 func (c *Conn) Hijack(in *bufio.Reader) (net.Conn, *bufio.ReadWriter, error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
+	if err := c.endPipelineLifetime(); err != nil {
+		return nil, nil, err
+	}
 	var pending []byte
 	if n := in.Buffered(); n > 0 {
 		p, _ := in.Peek(n)

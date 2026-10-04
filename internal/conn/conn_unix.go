@@ -4,6 +4,7 @@ package conn
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -43,6 +44,8 @@ type Conn struct {
 	timerSlot                   int // guarded by wheel.mu
 	timerTick                   int64
 	timerArmed                  atomic.Bool
+	pipelineHooks               PipelineHooks
+	pipeline                    pipelineHold
 }
 
 func (c *Conn) setState(s http.ConnState) {
@@ -98,7 +101,8 @@ func (c *Conn) cancelRequest() {
 // Close asks the owner loop to close the descriptor.
 func (c *Conn) Close() error {
 	c.cancelRequest()
-	return c.raw.Close()
+	err := c.endPipelineLifetime()
+	return errors.Join(err, c.raw.Close())
 }
 
 // LocalAddr returns the immutable local TCP address snapshot.
@@ -162,6 +166,9 @@ func (c *Conn) deadline(op string) (time.Time, <-chan struct{}) {
 }
 
 func (c *Conn) wait(op string, ready <-chan struct{}) error {
+	if err := c.PushPipeline(); err != nil {
+		return err
+	}
 	for {
 		c.mu.Lock()
 		if c.changed == nil {
@@ -229,53 +236,4 @@ func (c *Conn) Read(p []byte) (int, error) {
 		}
 		return 0, err
 	}
-}
-
-// Write blocks at socket backpressure instead of queueing unbounded output.
-func (c *Conn) Write(p []byte) (int, error) {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	total := 0
-	writeInterest := false
-	defer func() {
-		if writeInterest {
-			c.raw.SetInterest(true, false)
-		}
-	}()
-	for len(p) > 0 {
-		t, _ := c.deadline("write")
-		if !t.IsZero() && !time.Now().Before(t) {
-			c.cancelRequest()
-			return total, c.timeoutError("write")
-		}
-		ready := c.raw.WriteReady()
-		n, err := c.raw.Writev([][]byte{p})
-		total += n
-		p = p[n:]
-		if interrupted(err) {
-			continue
-		}
-		if wouldBlock(err) {
-			if !writeInterest {
-				if err = c.raw.SetInterest(true, true); err != nil {
-					return total, err
-				}
-				writeInterest = true
-			}
-			if err = c.wait("write", ready); err != nil {
-				c.cancelRequest()
-				return total, err
-			}
-			continue
-		}
-		if err != nil {
-			c.peerEOF()
-			c.cancelRequest()
-			return total, err
-		}
-		if n == 0 {
-			return total, io.ErrNoProgress
-		}
-	}
-	return total, nil
 }

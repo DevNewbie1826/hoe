@@ -107,11 +107,13 @@ func (w *Response) WriteHeader(code int) {
 		w.disableContinue(code >= 200)
 	}
 	if code < 200 && code != 101 {
+		w.record(w.pushPipeline())
 		writeStatus(w.out, w.req.ProtoAtLeast(1, 1), code)
 		w.record(w.header.WriteSubset(w.out, map[string]bool{"Content-Length": true, "Transfer-Encoding": true}))
 		_, err := w.out.WriteString("\r\n")
 		w.record(err)
 		w.record(w.out.Flush())
+		w.record(w.pushPipeline())
 		return
 	}
 	w.status = code

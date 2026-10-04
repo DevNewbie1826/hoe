@@ -49,6 +49,14 @@ type Server struct {
 	// IdleTimeout limits keep-alive waiting; zero uses ReadTimeout.
 	// Negative, or zero with nonpositive ReadTimeout, disables it.
 	IdleTimeout time.Duration
+	// PipelineFlushDelay bounds kernel coalescing of buffered HTTP/1 responses.
+	// Zero uses 1 ms, a positive value sets the cap, and a negative value
+	// disables coalescing for per-response delivery. Each response is still
+	// written before the next handler runs, but unlike net/http its delivery
+	// may be delayed up to the cap while a later pipelined handler blocks.
+	// Round completion and explicit flushes or handoffs push immediately.
+	// This setting applies only to the native plaintext TCP HTTP/1 engine.
+	PipelineFlushDelay time.Duration
 	// MaxHeaderBytes limits request line and headers, not body size.
 	// Zero uses http.DefaultMaxHeaderBytes.
 	MaxHeaderBytes int
@@ -116,7 +124,10 @@ func (s *Server) Serve(l net.Listener) error {
 		s.mu.Unlock()
 		return ErrServerClosed
 	}
-	e, err := conn.New(s.serving(), tcp, func() bool { return !s.noKeepAlive.Load() && !s.shutting.Load() })
+	e, err := conn.New(s.serving(), tcp, conn.Policy{
+		KeepAlive:          func() bool { return !s.noKeepAlive.Load() && !s.shutting.Load() },
+		PipelineFlushDelay: s.PipelineFlushDelay,
+	})
 	if err != nil {
 		s.mu.Unlock()
 		return err
