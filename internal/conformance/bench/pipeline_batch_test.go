@@ -40,11 +40,16 @@ func TestPipelineBatch(t *testing.T) {
 			before := systest.Snapshot().PushCalls
 			// When the real TCP client submits the entire pipeline in one write.
 			pipelineSend(t, rig.client, paths...)
+			if off {
+				// No cork is armed, so the existing TCP_NODELAY writes must
+				// deliver every response without a cap wait.
+				rig.client.SetReadDeadline(time.Now().Add(pipelineTolerance))
+			}
 			for range 16 {
 				pipelineReceipt(t, rig, "batch")
 			}
-			// Then all handlers observed the real kernel flag, and exactly
-			// one batch push (or sixteen per-response pushes) completed.
+			// Then all handlers observed the real kernel flag. Coalescing
+			// pushes once; off mode pushes nothing.
 			for range 16 {
 				if held := pipelineEvent(t, states); held != !off {
 					t.Errorf("handler kernel hold=%v want=%v", held, !off)
@@ -52,7 +57,7 @@ func TestPipelineBatch(t *testing.T) {
 			}
 			want := uint64(1)
 			if off {
-				want = 16
+				want = 0
 			}
 			for range want {
 				event := pipelineEvent(t, rig.pushes)
@@ -62,6 +67,13 @@ func TestPipelineBatch(t *testing.T) {
 			}
 			if delta := systest.Snapshot().PushCalls - before; delta != want {
 				t.Fatalf("push boundaries=%d want=%d", delta, want)
+			}
+			if off {
+				select {
+				case event := <-rig.pushes:
+					t.Fatalf("off mode pushed %+v", event)
+				default:
+				}
 			}
 			pipelineProbe(t, rig.raw, false)
 			t.Logf("PASS push boundaries=%d; hold during=%v, after=false", want, !off)

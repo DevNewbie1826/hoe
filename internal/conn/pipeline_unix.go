@@ -100,17 +100,13 @@ func (c *Conn) PushPipeline() error {
 	return c.pushPipelineLocked(false)
 }
 
+// finishPipelineResponse does not push. Non-negative delays coalesce in the
+// kernel and release at cap expiry or round end. A negative delay never
+// enables the cork; each response already leaves on the TCP_NODELAY write.
+// Pushing here would issue TCP_CORK/TCP_NOPUSH syscalls the pre-branch
+// server never made.
 func (c *Conn) finishPipelineResponse() error {
-	if c.engine.pipelineDelay >= 0 {
-		return nil
-	}
-	p := &c.pipeline
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.terminal {
-		return nil
-	}
-	return c.pushPipelineLocked(false)
+	return nil
 }
 
 // endPipelineLifetime invalidates callbacks before descriptor close/detach.
