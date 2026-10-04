@@ -10,19 +10,21 @@ import (
 // pipelineHold serializes hold epochs without taking writeMu: a writer can
 // wait for readiness while the cap callback must still push earlier bytes.
 type pipelineHold struct {
-	mu         sync.Mutex
-	holding    bool
-	terminal   bool
-	armed      bool
-	generation uint64
-	timer      *time.Timer
+	mu              sync.Mutex
+	holding         bool
+	terminal        bool
+	armed           bool
+	generation      uint64
+	timer           *time.Timer
+	timerGeneration uint64
+	timerPending    bool
 }
 
 func (c *Conn) beginPipeline() error {
 	p := &c.pipeline
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.terminal || c.engine.pipelineDelay < 0 {
+	if p.terminal || p.timerPending || c.engine.pipelineDelay < 0 {
 		return nil
 	}
 	if err := c.raw.EnableCork(); err != nil {
@@ -44,42 +46,61 @@ func (c *Conn) pipelineWrite(b []byte) (int, error) {
 		p.armed = true
 		p.generation++
 		generation := p.generation
-		expire := func() {
-			if hook := c.pipelineHooks.AfterExpiry; hook != nil {
-				defer hook()
-			}
-			if hook := c.pipelineHooks.BeforeExpiry; hook != nil {
-				hook()
-			}
-			p.mu.Lock()
-			defer p.mu.Unlock()
-			// Stop cannot join an already-running AfterFunc. The epoch guard
-			// makes that callback inert after release, close or a new round.
-			if !p.armed || !p.holding || p.terminal || p.generation != generation {
-				return
-			}
-			if err := c.pushPipelineLocked(true); err != nil {
-				c.raw.Close()
-			}
-		}
 		controlled := false
 		if hook := c.pipelineHooks.Timer; hook != nil {
-			controlled = hook(c.engine.pipelineDelay, expire)
+			controlled = hook(c.engine.pipelineDelay, func() { c.expirePipeline(generation, false) })
 		}
 		if !controlled {
-			p.timer = time.AfterFunc(c.engine.pipelineDelay, expire)
+			p.timerGeneration = generation
+			p.timerPending = true
+			if p.timer == nil {
+				p.timer = time.AfterFunc(c.engine.pipelineDelay, c.pipelineTimerExpired)
+			} else {
+				p.timer.Reset(c.engine.pipelineDelay)
+			}
 		}
 	}
 	return n, err
+}
+
+func (c *Conn) pipelineTimerExpired() {
+	p := &c.pipeline
+	p.mu.Lock()
+	generation := p.timerGeneration
+	p.mu.Unlock()
+	c.expirePipeline(generation, true)
+}
+
+func (c *Conn) expirePipeline(generation uint64, runtimeTimer bool) {
+	if hook := c.pipelineHooks.AfterExpiry; hook != nil {
+		defer hook()
+	}
+	if hook := c.pipelineHooks.BeforeExpiry; hook != nil {
+		hook()
+	}
+	p := &c.pipeline
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if runtimeTimer {
+		p.timerPending = false
+	}
+	// A Stop that loses to expiry leaves timerPending set until this invocation
+	// takes the lock. Intervening rounds stay uncorked, so Reset cannot let an
+	// old invocation adopt a newer epoch, even if it only starts after Stop.
+	if !p.armed || !p.holding || p.terminal || p.generation != generation {
+		return
+	}
+	if err := c.pushPipelineLocked(true); err != nil {
+		c.raw.Close()
+	}
 }
 
 func (c *Conn) pushPipelineLocked(expired bool) error {
 	p := &c.pipeline
 	p.holding, p.armed = false, false
 	p.generation++
-	if p.timer != nil {
-		p.timer.Stop()
-		p.timer = nil
+	if p.timer != nil && p.timer.Stop() {
+		p.timerPending = false
 	}
 	err := c.raw.PushCork(false)
 	if hook := c.pipelineHooks.Pushed; hook != nil {
