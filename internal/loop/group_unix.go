@@ -73,6 +73,16 @@ func (g *Group) Adopt(fd int) error {
 	return <-cmd.reply
 }
 
+// AdoptAsync transfers ownership and reports registration completion without
+// making the caller wait for the destination reactor.
+func (g *Group) AdoptAsync(fd int, complete func(error)) error {
+	c := &Conn{loop: g.owner(), fd: fd, token: g.tokens.Add(1), done: make(chan struct{})}
+	if err := c.loop.enqueue(&command{kind: adoptCommand, conn: c, complete: complete}); err != nil {
+		return errors.Join(err, syscall.Close(fd))
+	}
+	return nil
+}
+
 // Close closes owned descriptors and joins loops and workers. It must not
 // be called from a Handler callback. Conn.Done closes before OnClose is queued,
 // so blocking adapters can release their workers during shutdown.
@@ -128,6 +138,7 @@ type command struct {
 	conn        *Conn
 	read, write bool
 	reply       chan error
+	complete    func(error)
 }
 
 type reactor struct {
