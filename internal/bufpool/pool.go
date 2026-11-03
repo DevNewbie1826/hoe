@@ -21,8 +21,10 @@ var classOf = make([]uint8, (maxSize>>3)+1)
 // gcEpoch counts garbage collections so a class can tell its sync.Pool tier
 // was emptied. A collection is noticed through a finalizer tick: the tick
 // stays unreachable until a collection frees it, which runs the finalizer,
-// bumps the epoch and arms the next tick. Reading the epoch never takes a
-// class lock.
+// settles the classes that asked for it, bumps the epoch and arms the next
+// tick. The epoch is published after the settles, so once it advances every
+// flagged class has already settled against the new value. Get and Put never
+// read it: settling runs on the finalizer goroutine, off the loan paths.
 var gcEpoch atomic.Int64
 
 // collectionTick is 32 bytes on purpose, above the 16-byte tiny block: a
@@ -32,9 +34,37 @@ type collectionTick struct{ _ [32]byte }
 
 func armTick() {
 	runtime.SetFinalizer(&collectionTick{}, func(*collectionTick) {
+		settleFlaggedClasses()
 		gcEpoch.Add(1)
 		armTick()
 	})
+}
+
+// classSettleNeeded[i] asks the next tick to settle classes[i]. It lives
+// outside the class structs so the tick can check it without taking — or
+// dirtying — a line the loan paths keep hot: a class in steady state has no
+// fresh demand peak and no target growth, its flag stays clear, and the tick
+// never locks it.
+var classSettleNeeded [len(sizes)]atomic.Bool
+
+// settleFlaggedClasses notices a collection for every flagged class: the
+// sync.Pool tier was just emptied, so each flagged class keeps only what
+// its peak demand since the last settle justifies (settleLocked), with the
+// floor of one reserved slot. The flag is cleared before the class locks,
+// so a peak that arrives while this loop runs re-arms the next tick instead
+// of being lost.
+func settleFlaggedClasses() {
+	next := gcEpoch.Load() + 1
+	for i := range classes {
+		if !classSettleNeeded[i].Load() {
+			continue
+		}
+		classSettleNeeded[i].Store(false)
+		c := &classes[i]
+		c.mu.Lock()
+		c.settleLocked(sizes[i], next)
+		c.mu.Unlock()
+	}
 }
 
 func init() {
@@ -102,8 +132,9 @@ func (c *class) settleLocked(capacity int, epoch int64) {
 
 // growLocked raises the target by one slot under the aggregate budget. The
 // first slot of a touched class is exempt, so the floor of one reserved slot
-// stays affordable at any budget.
-func (c *class) growLocked(capacity int) {
+// stays affordable at any budget. A target above the floor is adaptive
+// state, so growth asks the next collection tick to settle the class.
+func (c *class) growLocked(idx, capacity int) {
 	if c.target == 0 {
 		c.target = 1
 		committed.Add(int64(capacity))
@@ -113,6 +144,7 @@ func (c *class) growLocked(capacity int) {
 			return
 		}
 		c.target++
+		classSettleNeeded[idx].Store(true)
 	}
 	if cap(c.reserve) < c.target {
 		grown := make([][]byte, len(c.reserve), 2*c.target)
@@ -136,12 +168,16 @@ func Get(size int) []byte {
 	capacity := sizes[idx]
 	c := &classes[idx]
 	c.mu.Lock()
-	if e := gcEpoch.Load(); e != c.epoch {
-		c.settleLocked(capacity, e)
-	}
 	c.borrowed++
 	if c.borrowed > c.hw {
 		c.hw = c.borrowed
+		// A new demand peak asks the next tick to settle — unless the peak
+		// is a single loan against a floor-only reserve, where settling is
+		// a certified no-op: the target cannot go below the floor and the
+		// peak cannot exceed it, so the tick is left alone entirely.
+		if c.borrowed > 1 || c.target > 1 {
+			classSettleNeeded[idx].Store(true)
+		}
 	}
 	if n := len(c.reserve); n != 0 {
 		b := c.reserve[n-1]
@@ -153,7 +189,7 @@ func Get(size int) []byte {
 	// A miss is demand evidence: the class holds less than the program keeps
 	// in flight, so the reserve may aim one slot higher.
 	if c.target < c.borrowed {
-		c.growLocked(capacity)
+		c.growLocked(idx, capacity)
 	}
 	c.mu.Unlock()
 	if b, ok := c.cache.Get().([]byte); ok {
@@ -181,9 +217,6 @@ func Put(b []byte) {
 	}
 	c := &classes[idx]
 	c.mu.Lock()
-	if e := gcEpoch.Load(); e != c.epoch {
-		c.settleLocked(capacity, e)
-	}
 	c.borrowed--
 	if len(c.reserve) < c.target {
 		c.reserve = append(c.reserve, b[:capacity])

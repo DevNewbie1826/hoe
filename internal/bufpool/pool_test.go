@@ -55,8 +55,8 @@ func TestOversizeAndEmpty(t *testing.T) {
 }
 
 // gcAndWait ends the current garbage-collection epoch and waits until the
-// tick that notices collections has advanced twice, so the next class
-// operation settles against a fresh epoch instead of a stale one.
+// tick that settles classes has advanced twice, so the next class operation
+// runs against a fresh, already-settled epoch instead of a stale one.
 func gcAndWait(tb testing.TB) {
 	tb.Helper()
 	want := gcEpoch.Load() + 2
