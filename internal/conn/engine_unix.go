@@ -27,7 +27,9 @@ type Engine struct {
 	listener        *net.TCPListener
 	mu              sync.Mutex
 	conns           map[*loop.Conn]*Conn
-	opening         int // guarded by mu; adopted sockets awaiting OnOpen completion
+	opening         int   // guarded by mu; adopted sockets awaiting OnOpen completion
+	adoptErr        error // guarded by mu
+	adoptions       sync.WaitGroup
 	changed         chan struct{}
 	stopping        atomic.Bool
 	pendingOutput   atomic.Int64
@@ -71,8 +73,21 @@ func New(s *http.Server, l *net.TCPListener, policy Policy) (*Engine, error) {
 
 // Serve accepts on the caller's listener and transfers sockets to the loops.
 // It returns when acceptance stops, independently of active request completion.
-func (e *Engine) Serve(l *net.TCPListener) error {
+func (e *Engine) Serve(l *net.TCPListener) (serveErr error) {
 	defer e.stopAcceptance()
+	defer func() {
+		e.adoptions.Wait()
+		e.mu.Lock()
+		err := e.adoptErr
+		e.mu.Unlock()
+		if err != nil {
+			if e.stopping.Load() {
+				serveErr = http.ErrServerClosed
+			} else {
+				serveErr = err
+			}
+		}
+	}()
 	var tempDelay time.Duration
 	for {
 		c, err := l.AcceptTCP()
@@ -122,17 +137,35 @@ func (e *Engine) Serve(l *net.TCPListener) error {
 			}
 			return err
 		}
-		e.mu.Lock()
-		e.opening++
-		e.mu.Unlock()
-		if err = e.group.Adopt(fd); err != nil {
-			e.finishOpen()
-			if e.stopping.Load() {
-				return http.ErrServerClosed
-			}
+		if err = e.adopt(fd); err != nil {
 			return err
 		}
 	}
+}
+
+func (e *Engine) adopt(fd int) error {
+	e.mu.Lock()
+	e.opening++
+	e.mu.Unlock()
+	e.adoptions.Add(1)
+	if err := e.group.AdoptAsync(fd, e.adopted); err != nil {
+		e.adopted(err)
+		return err
+	}
+	return nil
+}
+
+func (e *Engine) adopted(err error) {
+	if err != nil {
+		e.mu.Lock()
+		if e.adoptErr == nil {
+			e.adoptErr = err
+		}
+		e.mu.Unlock()
+		e.finishOpen()
+		e.listener.Close()
+	}
+	e.adoptions.Done()
 }
 
 // OnOpen creates the stable net.Conn identity and context chain.

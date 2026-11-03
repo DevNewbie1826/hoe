@@ -130,6 +130,9 @@ func (l *reactor) drain() bool {
 		if cmd.reply != nil {
 			cmd.reply <- err
 		}
+		if cmd.complete != nil {
+			cmd.complete(err)
+		}
 	}
 	return stop
 }
@@ -189,6 +192,9 @@ func (l *reactor) finish(cause error) {
 		}
 		if cmd.reply != nil {
 			cmd.reply <- net.ErrClosed
+		}
+		if cmd.complete != nil {
+			cmd.complete(net.ErrClosed)
 		}
 	}
 	for fd, e := range l.table {
