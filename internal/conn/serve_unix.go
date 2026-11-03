@@ -20,8 +20,7 @@ import (
 )
 
 type requestIO struct {
-	in  *bufio.Reader
-	out *bufio.Writer
+	in *bufio.Reader
 }
 
 var requestIOPool = sync.Pool{New: func() any {
@@ -32,7 +31,71 @@ var corkWriterPool = sync.Pool{New: func() any {
 	return bufio.NewWriterSize(io.Discard, 64<<10)
 }}
 
+var outputWriterPool = sync.Pool{New: func() any {
+	return bufio.NewWriterSize(io.Discard, 4096)
+}}
+
 const maxPendingOutput = 64 << 20
+
+// roundOutput owns the writer loan across responses in one read round.
+// Flush can return the loan while the handler and round remain active.
+type roundOutput struct {
+	*Conn
+	out     *bufio.Writer
+	corked  bool
+	cleanup func()
+}
+
+func (r *roundOutput) acquireCork() {
+	if r.out != nil {
+		return
+	}
+	if r.engine.pendingOutput.Add(64<<10) <= maxPendingOutput {
+		r.corked = true
+		r.out = corkWriterPool.Get().(*bufio.Writer)
+		r.out.Reset(r.Conn)
+	} else {
+		r.engine.pendingOutput.Add(-(64 << 10))
+	}
+}
+
+func (r *roundOutput) AcquireResponseOutput() *bufio.Writer {
+	if r.out == nil {
+		r.out = outputWriterPool.Get().(*bufio.Writer)
+		r.out.Reset(r.Conn)
+	}
+	return r.out
+}
+
+func (r *roundOutput) GrowResponseOutput() *bufio.Writer {
+	// The current writer must be empty: bufio.Writer cannot transfer pending
+	// bytes to a larger buffer without sending them prematurely.
+	if r.out.Size() >= 64<<10 || r.out.Buffered() != 0 {
+		return r.out
+	}
+	r.ReleaseResponseOutput()
+	r.acquireCork()
+	return r.AcquireResponseOutput()
+}
+
+func (r *roundOutput) ReleaseResponseOutput() {
+	if r.out == nil {
+		return
+	}
+	r.out.Reset(io.Discard)
+	if r.corked {
+		corkWriterPool.Put(r.out)
+		r.engine.pendingOutput.Add(-(64 << 10))
+		r.corked = false
+	} else {
+		outputWriterPool.Put(r.out)
+	}
+	r.out = nil
+}
+
+func (r *roundOutput) SetResponseCleanup(cleanup func()) {
+	r.cleanup = cleanup
+}
 
 func wouldBlock(err error) bool {
 	return errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK)
@@ -47,16 +110,11 @@ func completeHead(p []byte) bool {
 func (c *Conn) round() {
 	var buffers *requestIO
 	var in *bufio.Reader
-	var out *bufio.Writer
-	corked := false
+	output := &roundOutput{Conn: c}
 	defer func() {
 		if buffers != nil {
 			in.Reset(nil)
-			out.Reset(io.Discard)
-			if corked {
-				corkWriterPool.Put(out)
-				c.engine.pendingOutput.Add(-(64 << 10))
-			}
+			output.ReleaseResponseOutput()
 			requestIOPool.Put(buffers)
 		}
 	}()
@@ -125,23 +183,10 @@ func (c *Conn) round() {
 		first := buffers == nil
 		if first {
 			buffers = requestIOPool.Get().(*requestIO)
-			in, out = buffers.in, buffers.out
-			// Reserve cork capacity, not only bytes already pending. When
-			// the server budget is full, retain std's 4KiB blocking path.
-			corked = c.engine.pendingOutput.Add(64<<10) <= maxPendingOutput
-			if corked {
-				out = corkWriterPool.Get().(*bufio.Writer)
-			} else {
-				c.engine.pendingOutput.Add(-(64 << 10))
-				if out == nil {
-					out = bufio.NewWriterSize(io.Discard, 4096)
-					buffers.out = out
-				}
-			}
+			in = buffers.in
 			in.Reset(c)
-			out.Reset(c)
 		}
-		if !c.serveRequest(in, out, first) {
+		if !c.serveRequest(in, output, first) {
 			return
 		}
 	}
@@ -214,7 +259,7 @@ func (c *Conn) readHead() (bool, error) {
 	}
 }
 
-func (c *Conn) serveRequest(in *bufio.Reader, out *bufio.Writer, first bool) bool {
+func (c *Conn) serveRequest(in *bufio.Reader, output *roundOutput, first bool) bool {
 	r, err := http1.ReadRequest(in, c.engine.server.MaxHeaderBytes)
 	if err != nil {
 		http1.WriteError(c, err)
@@ -231,6 +276,7 @@ func (c *Conn) serveRequest(in *bufio.Reader, out *bufio.Writer, first bool) boo
 				c.Close()
 				return false
 			}
+			output.acquireCork()
 		}
 	}
 	cancel := http1.BindContext(r, c.base)
@@ -254,7 +300,11 @@ func (c *Conn) serveRequest(in *bufio.Reader, out *bufio.Writer, first bool) boo
 	}
 	c.SetReadDeadline(readDeadline)
 	c.SetWriteDeadline(after(c.engine.server.WriteTimeout))
-	w := http1.NewResponse(r, in, out, c)
+	w := http1.NewResponse(r, in, output.AcquireResponseOutput(), output)
+	defer func() {
+		output.cleanup()
+		output.cleanup = nil
+	}()
 	if !c.engine.keepAlive() {
 		w.DisableKeepAlives()
 	}
