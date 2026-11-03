@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -67,4 +68,33 @@ func TestGuardWriteTimeoutResetsPerRequest(t *testing.T) {
 		t.Fatalf("std keep-alive WriteTimeout reset produced %q", want)
 	}
 	same(t, want, got)
+
+	// Enforcement, not deadline bookkeeping: a cleared write deadline still
+	// serves both bodies above. A write, a wait past WriteTimeout, and a
+	// second write must not deliver the late bytes.
+	cut := func(own bool) {
+		h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, "early")
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(250 * time.Millisecond)
+			fmt.Fprint(w, "late-write")
+		})
+		addr, _ := launch(t, own, &http.Server{Handler: h, WriteTimeout: 50 * time.Millisecond})
+		c := dial(t, addr)
+		if _, err := io.WriteString(c, request("GET", "/", true)); err != nil {
+			t.Fatal(err)
+		}
+		p, err := io.ReadAll(c)
+		got := string(p)
+		if strings.Contains(got, "late-write") {
+			t.Fatalf("own=%v WriteTimeout did not cut the late write: %q", own, got)
+		}
+		if !strings.Contains(got, "early") {
+			t.Fatalf("own=%v early write not delivered: %q err=%v", own, got, err)
+		}
+	}
+	cut(false)
+	cut(true)
 }
