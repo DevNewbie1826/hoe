@@ -218,12 +218,23 @@ func TestReserveBudgetBoundsAggregate(t *testing.T) {
 		size = 2048
 		n    = 10
 	)
+	idx := int(classOf[(size+7)>>3])
+	c := &classes[idx]
+	// Repetitions in one process (-count) must see the same starting
+	// state: refund the class's committed bytes and clear its adaptive
+	// state so the budget below is derived from a fresh class, not from
+	// whatever an earlier repetition of this test left behind.
+	c.mu.Lock()
+	committed.Add(int64(-c.target * size))
+	c.target = 0
+	c.reserve = nil
+	c.hw = 0
+	c.mu.Unlock()
 	old := reserveBudget
 	reserveBudget = committed.Load() + 4*size
 	defer func() { reserveBudget = old }()
 	release(borrowConcurrently(size, n))
-	idx := int(classOf[(size+7)>>3])
-	target := classes[idx].target
+	target := c.target
 	if target >= n {
 		t.Fatalf("reserve grew to %d slots past the %d-byte budget", target, reserveBudget)
 	}

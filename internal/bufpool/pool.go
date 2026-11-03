@@ -84,10 +84,16 @@ func (c *class) settleLocked(capacity int, epoch int64) {
 	}
 	if t < c.target {
 		committed.Add(int64(t-c.target) * int64(capacity))
-		for i := t; i < len(c.reserve); i++ {
-			c.reserve[i] = nil
+		// The reserve can hold fewer slots than the new target because
+		// buffers are on loan; it refills opportunistically on Put.
+		// Truncate only the slots that exist — reslicing past len would
+		// expose never-filled capacity as nil entries.
+		if t < len(c.reserve) {
+			for i := t; i < len(c.reserve); i++ {
+				c.reserve[i] = nil
+			}
+			c.reserve = c.reserve[:t]
 		}
-		c.reserve = c.reserve[:t]
 		c.target = t
 	}
 	c.hw = 0
