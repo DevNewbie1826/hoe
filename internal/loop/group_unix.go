@@ -158,6 +158,18 @@ type command struct {
 const (
 	slotBits = 24
 	slotMask = 1<<slotBits - 1
+	// The slot index shifts left one bit inside the slot field, so tokens
+	// address at most maxSlots connections, and the sequence stops at
+	// maxSeq so it never wraps onto an earlier identity.
+	maxSlots = 1 << (slotBits - 1)
+	maxSeq   = 1<<(64-slotBits) - 1
+)
+
+// Registration fails cleanly when the token space is exhausted instead of
+// publishing a token that decodes to another live registration.
+var (
+	errSlotsExhausted = errors.New("loop: connection slot table exhausted")
+	errSeqExhausted   = errors.New("loop: registration sequence exhausted")
 )
 
 type reactor struct {
@@ -201,31 +213,44 @@ func (l *reactor) call(cmd *command) error {
 	return <-cmd.reply
 }
 
-// mint returns the next registration token with low in its low bits.
+// mint returns the next registration token with low in its low bits. The
+// caller must have verified the limits first; mint itself never wraps.
 func (l *reactor) mint(low uint64) uint64 {
 	l.seq++
 	return l.seq<<slotBits | low
 }
 
 // register reserves a slot for e, mints its token, and publishes the entry.
-func (l *reactor) register(e *entry) uint64 {
+// Exhaustion fails before any state changes: a failed registration consumes
+// no slot and never publishes a token that decodes to another entry.
+func (l *reactor) register(e *entry) (uint64, error) {
+	if l.seq >= maxSeq {
+		return 0, errSeqExhausted
+	}
 	slot := len(l.slots)
 	if n := len(l.free); n != 0 {
 		slot, l.free = l.free[n-1], l.free[:n-1]
 	} else {
+		if slot >= maxSlots {
+			return 0, errSlotsExhausted
+		}
 		l.slots = append(l.slots, nil)
 	}
 	e.token = l.mint(uint64(slot) << 1)
 	l.slots[slot] = e
-	return e.token
+	return e.token, nil
 }
 
 // registerConn registers a connection and republishes the token on it, so
-// interest and removal commands carry the identity the poller reports.
-func (l *reactor) registerConn(c *Conn) uint64 {
-	token := l.register(&entry{conn: c})
+// interest and removal commands carry the identity the poller reports. On
+// exhaustion the connection keeps its zero token and owns no slot.
+func (l *reactor) registerConn(c *Conn) (uint64, error) {
+	token, err := l.register(&entry{conn: c})
+	if err != nil {
+		return 0, err
+	}
 	c.token = token
-	return token
+	return token, nil
 }
 
 // at resolves a poll token to its live registration.
@@ -269,6 +294,9 @@ func (l *reactor) hasListener(fd int) bool {
 
 // registerListener registers fd for read readiness and records it.
 func (l *reactor) registerListener(fd int) error {
+	if l.seq >= maxSeq {
+		return errSeqExhausted
+	}
 	token := l.mint(0)
 	if err := l.p.Add(fd, token, true, false); err != nil {
 		return err

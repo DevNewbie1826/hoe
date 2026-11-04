@@ -1,18 +1,17 @@
-//go:build !race
-
-// sync.Pool drops Puts under -race.
-
 package sched
 
 import (
 	"runtime"
-	"runtime/debug"
 	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
 )
 
+// TestSequentialIdleWaitsShareTimers pins the pool's timer-sharing contract:
+// the pool's own free list (not a sync.Pool cache) carries idle timers
+// between waits, so sequential idle waits allocate exactly one timer. The
+// assertion is deterministic and holds under -race.
 func TestSequentialIdleWaitsShareTimers(t *testing.T) {
 	// Publish frees before the next test reads in-use bytes.
 	t.Cleanup(func() {
@@ -22,9 +21,6 @@ func TestSequentialIdleWaitsShareTimers(t *testing.T) {
 	prevRate := runtime.MemProfileRate
 	runtime.MemProfileRate = 1
 	t.Cleanup(func() { runtime.MemProfileRate = prevRate })
-	// GC would clear sync.Pool and force a fresh timer on the next wait.
-	prevGC := debug.SetGCPercent(-1)
-	t.Cleanup(func() { debug.SetGCPercent(prevGC) })
 
 	synctest.Test(t, func(t *testing.T) {
 		const extra = 32
@@ -40,6 +36,8 @@ func TestSequentialIdleWaitsShareTimers(t *testing.T) {
 		for range extra {
 			idleOnce(t, p)
 		}
+		// The free list guarantees reuse: no later wait may arm a timer the
+		// pool does not already hold.
 		if extraBytes := poolRunTimerAllocBytes() - before - first; extraBytes != 0 {
 			t.Fatalf("idle waits allocated %d more Pool.run timer bytes, want 0 (first=%d waits=%d)", extraBytes, first, extra)
 		}
@@ -67,8 +65,7 @@ func idleOnce(t *testing.T, p *Pool) {
 }
 
 func poolRunTimerAllocBytes() int64 {
-	// MemProfile publishes allocs on a GC cycle. The caller must not be
-	// between release and the next acquire: GC clears sync.Pool.
+	// MemProfile publishes allocs on a GC cycle.
 	runtime.GC()
 	var recs []runtime.MemProfileRecord
 	for {

@@ -79,8 +79,15 @@ func (l *reactor) drain() bool {
 					err = net.ErrClosed
 				} else {
 					// The compact slot, not the descriptor, identifies this
-					// registration; republish its token before the poller sees it.
-					err = l.p.Add(c.fd, l.registerConn(c), true, false)
+					// registration; republish its token before the poller sees
+					// it. An exhausted token space fails before a slot is
+					// taken, so the failure path below balances exactly as
+					// for a rejected Add.
+					var token uint64
+					token, err = l.registerConn(c)
+					if err == nil {
+						err = l.p.Add(c.fd, token, true, false)
+					}
 				}
 				if err != nil {
 					c.mu.Lock()

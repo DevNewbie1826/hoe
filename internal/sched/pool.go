@@ -23,15 +23,26 @@ type Pool struct {
 	count  int
 	wg     sync.WaitGroup
 	// timers shares idle timers across this pool's workers. A timer must
-	// fire on the clock that armed it, so timers never cross pools.
-	timers sync.Pool // *time.Timer
+	// fire on the clock that armed it, so timers never cross pools. The
+	// list holds stopped, drained timers only: releaseIdleTimer publishes
+	// a timer after Stop and drain, and acquireIdleTimer rearms it, so a
+	// later idle wait deterministically reuses an earlier one.
+	timers []*time.Timer
 }
 
+// acquireIdleTimer returns an armed idle timer, deterministically reusing
+// a timer this pool still holds.
 func (p *Pool) acquireIdleTimer() *time.Timer {
-	if t, ok := p.timers.Get().(*time.Timer); ok {
+	p.mu.Lock()
+	if n := len(p.timers); n != 0 {
+		t := p.timers[n-1]
+		p.timers[n-1] = nil
+		p.timers = p.timers[:n-1]
+		p.mu.Unlock()
 		t.Reset(p.expiry)
 		return t
 	}
+	p.mu.Unlock()
 	return time.NewTimer(p.expiry)
 }
 
@@ -42,7 +53,9 @@ func (p *Pool) releaseIdleTimer(t *time.Timer) {
 	case <-t.C:
 	default:
 	}
-	p.timers.Put(t)
+	p.mu.Lock()
+	p.timers = append(p.timers, t)
+	p.mu.Unlock()
 }
 
 // New creates a pool whose idle workers expire after idleTimeout.
