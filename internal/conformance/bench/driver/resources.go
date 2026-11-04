@@ -111,13 +111,16 @@ func resources(binary, impl, wsclient string) (err error) {
 		return fmt.Errorf("server GET allocations %.4f exceed 6", allocations)
 	}
 	c.Close()
-	// The admin stats request itself is present in both snapshots.
-	before, err = readStats(p, 0)
-	if err != nil {
-		return err
-	}
 	idleClients = make([]net.Conn, 0, 10000)
-	for range 10000 {
+	var baseline int
+	for i := range 10000 {
+		if i == 1 {
+			// The engine's L+2 startup population sits in the baseline;
+			// transient workers (including the one that served the first connection) drain inside the 3s min-window.
+			if baseline, err = goroutineFloor(p, 1); err != nil {
+				return err
+			}
+		}
 		c, err := net.DialTimeout("tcp", p.Address, 5*time.Second)
 		if err != nil {
 			return err
@@ -135,10 +138,37 @@ func resources(binary, impl, wsclient string) (err error) {
 	if err != nil {
 		return err
 	}
-	delta := after.Goroutines - before.Goroutines
+	floor, err := goroutineFloor(p, 10000)
+	if err != nil {
+		return err
+	}
+	// The admin stats request itself is present in both floors.
+	delta := floor - baseline
 	fmt.Printf("RESOURCE impl=%s idle_connections=%d server_goroutine_delta=%d errors=0 all_bodies_validated=true\n", impl, after.Idle, delta)
-	if after.Idle != 10000 || (impl == "hoe" && delta > 50) {
+	if after.Idle != 10000 || (impl == "hoe" && delta > 5) {
 		return fmt.Errorf("idle resources connections=%d goroutine delta=%d", after.Idle, delta)
 	}
 	return nil
+}
+
+// goroutineFloor polls the server's NumGoroutine every 50ms across the full 3s window
+// and returns the minimum. The deadline is the window: it never exits early.
+func goroutineFloor(p *process, idle int) (int, error) {
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	floor := int(^uint(0) >> 1)
+	for {
+		st, err := readStats(p, idle)
+		if err != nil {
+			return 0, err
+		}
+		floor = min(floor, st.Goroutines)
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			return floor, nil
+		}
+	}
 }
