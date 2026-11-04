@@ -581,7 +581,8 @@ func TestServeAllShutdownDuringBaseContext(t *testing.T) {
 // F1 regression (adversarial finding): a connection whose accept returns
 // from a listener's backlog while StopListening's sweep ends that listener
 // must still carry the listener's BaseContext, not context.Background().
-// The probabilistic window is widened by a queued dial before shutdown.
+// ConnContext observes every adopted connection's context: none may arrive
+// without the swept listener's base context value.
 func TestServeAllSweepKeepsBaseContext(t *testing.T) {
 	live, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -591,13 +592,19 @@ func TestServeAllSweepKeepsBaseContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var seen atomic.Value
+	var mu sync.Mutex
+	missing, checked := 0, 0
 	s := &Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}),
 		BaseContext: func(l net.Listener) context.Context {
-			ctx := context.WithValue(context.Background(), ctxKey{}, l.Addr().String())
-			if l.Addr().String() == target.Addr().String() {
-				seen.Store(ctx)
+			return context.WithValue(context.Background(), ctxKey{}, l.Addr().String())
+		},
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			mu.Lock()
+			defer mu.Unlock()
+			checked++
+			if got, _ := ctx.Value(ctxKey{}).(string); got == "" {
+				missing++
 			}
 			return ctx
 		},
@@ -607,8 +614,8 @@ func TestServeAllSweepKeepsBaseContext(t *testing.T) {
 
 	// Queue connections on the target's backlog, then shut down: the sweep
 	// ends the target while its backlog still holds dials.
-	dials := make([]net.Conn, 0, 16)
-	for range 16 {
+	dials := make([]net.Conn, 0, 32)
+	for range 32 {
 		c, derr := net.DialTimeout("tcp", target.Addr().String(), time.Second)
 		if derr != nil {
 			t.Fatal(derr)
@@ -616,7 +623,7 @@ func TestServeAllSweepKeepsBaseContext(t *testing.T) {
 		dials = append(dials, c)
 	}
 	time.Sleep(50 * time.Millisecond)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
 	defer cancel()
 	if serr := s.Shutdown(ctx); serr != nil && !errors.Is(serr, context.DeadlineExceeded) {
 		t.Fatalf("Shutdown = %v", serr)
@@ -625,13 +632,63 @@ func TestServeAllSweepKeepsBaseContext(t *testing.T) {
 		c.Close()
 	}
 	<-errc
-	// The regression is probabilistic at the boundary; the invariant it
-	// guards is asserted structurally by the sweep probes in the evidence
-	// root, and here by the fact that shutdown completed with the target's
-	// context registered.
-	if seen.Load() == nil {
-		t.Fatal("BaseContext for the swept listener never ran")
+	mu.Lock()
+	defer mu.Unlock()
+	if checked == 0 {
+		t.Fatal("no connection contexts observed")
+	}
+	if missing != 0 {
+		t.Fatalf("%d of %d connections lost their listener's base context", missing, checked)
 	}
 }
 
 type ctxKey struct{}
+
+// A-3 deterministic companion (adversarial p19 shape): closing many listeners
+// one by one while their siblings keep adopting panics an engine-wide
+// adoption WaitGroup; the per-listener tracking must survive the churn.
+func TestServeAllChurnListenerExitsUnderLoad(t *testing.T) {
+	const listeners = 24
+	ls := make([]net.Listener, 0, listeners)
+	for range listeners {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ls = append(ls, l)
+	}
+	s := &Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})}
+	errc := make(chan error, 1)
+	go func() { errc <- s.ServeAll(ls...) }()
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, l := range ls {
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+			client := &http.Client{Timeout: time.Second}
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				res, err := client.Get("http://" + addr + "/echo")
+				if err != nil {
+					return
+				}
+				res.Body.Close()
+			}
+		}(l.Addr().String())
+	}
+	for i := 0; i < listeners-1; i += 2 {
+		time.Sleep(10 * time.Millisecond)
+		ls[i].Close()
+	}
+	time.Sleep(50 * time.Millisecond)
+	s.Close()
+	close(stop)
+	wg.Wait()
+	<-errc
+}
