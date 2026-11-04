@@ -29,7 +29,6 @@ type Engine struct {
 	conns           map[*loop.Conn]*Conn
 	opening         int   // guarded by mu; adopted sockets awaiting OnOpen completion
 	acceptErr       error // guarded by mu; listener close errors observed while stopping
-	adoptions       sync.WaitGroup
 	changed         chan struct{}
 	stopping        atomic.Bool
 	pendingOutput   atomic.Int64

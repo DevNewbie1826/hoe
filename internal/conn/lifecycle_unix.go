@@ -25,19 +25,32 @@ func (e *Engine) watchLocked() <-chan struct{} {
 }
 
 // StopListening stops all acceptance without interrupting active responses.
-// Listeners already registered are closed; each Serve loop then publishes the
-// engine-wide stop as its listener ends.
+// Listeners whose accept loop already runs publish the engine-wide stop as
+// their loop ends; listeners that are reserved but not yet serving have no
+// loop to observe the close, so their listener is ended here directly — a
+// listener parked in BaseContext cannot stall engine shutdown.
 func (e *Engine) StopListening() error {
 	e.stopping.Store(true)
 	e.mu.Lock()
 	ls := make([]*net.TCPListener, 0, len(e.listeners))
-	for l := range e.listeners {
-		ls = append(ls, l)
+	for l, st := range e.listeners {
+		if st.serving {
+			ls = append(ls, l)
+		}
 	}
-	last := len(ls) == 0
+	unserved := make([]*net.TCPListener, 0, len(e.listeners))
+	for l, st := range e.listeners {
+		if !st.serving {
+			unserved = append(unserved, l)
+		}
+	}
+	last := len(e.listeners) == 0 || len(unserved) == len(e.listeners)
 	e.mu.Unlock()
 	for _, l := range ls {
 		e.noteListenerClose(l.Close())
+	}
+	for _, l := range unserved {
+		e.endListener(l)
 	}
 	if last {
 		e.stopOnce.Do(func() { close(e.stopped) })

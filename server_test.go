@@ -479,3 +479,101 @@ func TestServeAllEarlyReturnClosesListeners(t *testing.T) {
 		t.Error("unix listener still accepts after ServeAll returned")
 	}
 }
+
+// A-3 regression (adversarial finding): one listener's accept-loop exit must
+// not wait on a WaitGroup its siblings still add to — per-listener adoption
+// tracking. Closing listeners under load used to panic with
+// "sync: WaitGroup is reused before previous Wait has returned".
+func TestServeAllListenerExitUnderSiblingAdoption(t *testing.T) {
+	ls := make([]net.Listener, 0, 6)
+	for range 6 {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ls = append(ls, l)
+	}
+	s := &Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})}
+	errc := make(chan error, 1)
+	go func() { errc <- s.ServeAll(ls...) }()
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, l := range ls {
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+			client := &http.Client{Timeout: time.Second}
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				res, err := client.Get("http://" + addr + "/echo")
+				if err != nil {
+					return // listener closed: fine
+				}
+				res.Body.Close()
+			}
+		}(l.Addr().String())
+	}
+	// Close listeners one by one while the survivors keep accepting: each
+	// closed listener's loop waits out its own adoptions while siblings add.
+	for i := 0; i < 3; i++ {
+		time.Sleep(20 * time.Millisecond)
+		ls[i].Close()
+	}
+	time.Sleep(50 * time.Millisecond)
+	s.Close()
+	close(stop)
+	wg.Wait()
+	<-errc
+}
+
+// A-4 regression (adversarial finding): a listener parked inside BaseContext
+// during reserve has no accept loop to publish acceptance-stop, so Shutdown
+// must end it directly instead of blocking past its context.
+func TestServeAllShutdownDuringBaseContext(t *testing.T) {
+	l1, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parked := make(chan struct{}, 1)
+	s := &Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}),
+		BaseContext: func(l net.Listener) context.Context {
+			if l.Addr().String() == l2.Addr().String() {
+				parked <- struct{}{}
+				time.Sleep(3 * time.Second)
+			}
+			return context.Background()
+		},
+	}
+	errc := make(chan error, 1)
+	go func() { errc <- s.ServeAll(l1, l2) }()
+	<-parked // l1 is serving; l2 is reserved but parked in BaseContext
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.Shutdown(ctx) }()
+	select {
+	case <-done:
+		// Shutdown returned while l2 was still parked: the fix works.
+	case <-time.After(3 * time.Second):
+		t.Fatal("Shutdown blocked past its context while a listener was parked in BaseContext")
+	}
+	select {
+	case err := <-errc:
+		if err != nil && !errors.Is(err, ErrServerClosed) {
+			t.Fatalf("ServeAll = %v", err)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("ServeAll never returned after Shutdown")
+	}
+}

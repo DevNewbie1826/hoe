@@ -13,10 +13,15 @@ import (
 )
 
 // listenerState tracks one listener's acceptance inside the engine: the base
-// context its connections carry, and the adoption failure that stopped it.
+// context its connections carry, the adoption failure that stopped it, the
+// in-flight adoptions its accept loop must outlive, and whether its accept
+// loop has started (a reserved listener with no loop yet is ended by
+// StopListening, so a blocked BaseContext cannot stall engine shutdown).
 type listenerState struct {
-	base     context.Context
-	adoptErr error // guarded by Engine.mu
+	base      context.Context
+	adoptErr  error // guarded by Engine.mu
+	adoptions sync.WaitGroup
+	serving   bool // guarded by Engine.mu
 }
 
 // reserve creates l's listener state, calling BaseContext once, and
@@ -91,8 +96,13 @@ func (e *Engine) ServeAll(ls ...*net.TCPListener) error {
 
 // serveReserved runs one registered listener's accept loop to its end.
 func (e *Engine) serveReserved(l *net.TCPListener, st *listenerState) (serveErr error) {
+	e.mu.Lock()
+	st.serving = true
+	e.mu.Unlock()
 	defer func() {
-		e.adoptions.Wait()
+		// Only this listener's accept loop can add to its adoptions, and
+		// the loop has ended here, so the wait cannot race a later Add.
+		st.adoptions.Wait()
 		e.mu.Lock()
 		adoptErr := st.adoptErr
 		e.mu.Unlock()
@@ -191,9 +201,9 @@ func (e *Engine) adopt(fd int, l *net.TCPListener) error {
 		// Adoptions outside a running Serve carry no listener base context.
 		st = &listenerState{base: context.Background()}
 	}
-	e.adoptions.Add(1)
-	if err := e.group.AdoptAsync(fd, st.base, func(err error) { e.adopted(err, l) }); err != nil {
-		e.adopted(err, l)
+	st.adoptions.Add(1)
+	if err := e.group.AdoptAsync(fd, st.base, func(err error) { e.adopted(err, l, st) }); err != nil {
+		e.adopted(err, l, st)
 		return err
 	}
 	return nil
@@ -202,15 +212,15 @@ func (e *Engine) adopt(fd int, l *net.TCPListener) error {
 // adopted attributes a registration failure to the listener that accepted
 // the socket: that listener's state latches the error and its acceptance
 // stops, leaving the engine's other listeners untouched.
-func (e *Engine) adopted(err error, l *net.TCPListener) {
+func (e *Engine) adopted(err error, l *net.TCPListener, st *listenerState) {
 	if err != nil {
 		e.mu.Lock()
-		if st := e.listeners[l]; st != nil && st.adoptErr == nil {
-			st.adoptErr = err
+		if cur := e.listeners[l]; cur != nil && cur.adoptErr == nil {
+			cur.adoptErr = err
 		}
 		e.mu.Unlock()
 		e.finishOpen()
 		l.Close()
 	}
-	e.adoptions.Done()
+	st.adoptions.Done()
 }
