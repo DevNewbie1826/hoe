@@ -27,8 +27,8 @@ func TestIdleTenThousandConnections(t *testing.T) {
 				idle <- struct{}{}
 			}
 		}})
-	before := runtime.NumGoroutine()
 	beforeBuffers := bufpool.Outstanding()
+	var before int
 	cs := make([]net.Conn, 0, count)
 	defer func() {
 		for _, c := range cs {
@@ -38,6 +38,9 @@ func TestIdleTenThousandConnections(t *testing.T) {
 	}()
 	// Given 10k real TCP clients, each with a completed keep-alive response.
 	for i := 0; i < count; i++ {
+		if i == 1 {
+			before = goroutineFloor(t)
+		}
 		c, err := net.DialTimeout("tcp", addr, 5*time.Second)
 		if err != nil {
 			t.Fatalf("connection %d: %v", i, err)
@@ -59,16 +62,43 @@ func TestIdleTenThousandConnections(t *testing.T) {
 		signal(t, idle)
 	}
 	// When all StateIdle events have completed, no sleeping guesses are needed.
-	delta := runtime.NumGoroutine() - before
+	delta := goroutineFloor(t) - before
 	res := engineconn.SnapshotResources()
 	// Then parked HTTP connections consume neither goroutines nor I/O loans.
-	if delta > 50 {
-		t.Fatalf("10000 idle connections add %d server goroutines, limit50", delta)
+	// The engine's L+2 startup population and the warmup worker sit in the baseline;
+	// transient workers drain inside the 3s min-window;
+	// the ceiling is therefore host-size independent with a deterministic leak floor of 6 goroutines.
+	if delta > 5 {
+		t.Fatalf("10000 idle connections add %d server goroutines over the drained baseline, limit5", delta)
 	}
 	if res.Connections != count || res.IdleBuffers != 0 || bufpool.Outstanding() != beforeBuffers {
 		t.Fatalf("idle resources=%+v buffer delta=%d", res, bufpool.Outstanding()-beforeBuffers)
 	}
-	t.Logf("PASS %d idle connections, server goroutines=%d, idle buffers=0", count, delta)
+	t.Logf("PASS %d idle connections, drained-baseline server goroutines=%d, idle buffers=0", count, delta)
+}
+
+// goroutineFloor polls runtime.NumGoroutine every 50ms across the full 3s window
+// and returns the minimum. The deadline is the window: it never exits early.
+func goroutineFloor(t *testing.T) int {
+	t.Helper()
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	floor := runtime.NumGoroutine()
+	for {
+		select {
+		case <-ticker.C:
+			if n := runtime.NumGoroutine(); n < floor {
+				floor = n
+			}
+		case <-deadline.C:
+			if n := runtime.NumGoroutine(); n < floor {
+				floor = n
+			}
+			return floor
+		}
+	}
 }
 
 func TestPartialHeaderAndAbortedBodyCPU(t *testing.T) {
