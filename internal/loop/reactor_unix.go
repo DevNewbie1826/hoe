@@ -150,7 +150,7 @@ func (l *reactor) accept(fd int) {
 			syscall.Close(n)
 			continue
 		}
-		target := l.g.owner()
+		target := l.g.owner(n)
 		c := &Conn{loop: target, fd: n, done: make(chan struct{})}
 		if err := target.enqueue(&command{kind: adoptCommand, conn: c}); err != nil {
 			syscall.Close(n)
