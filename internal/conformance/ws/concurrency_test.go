@@ -60,7 +60,6 @@ func TestIdle5000Connections(t *testing.T) {
 			OnClose: func(c *ws.Conn, err error) { closed <- err },
 		})
 	}))
-	baseline := goroutines()
 	clients := make([]net.Conn, 0, count)
 	serverConns := make([]*ws.Conn, 0, count)
 	defer func() {
@@ -69,7 +68,11 @@ func TestIdle5000Connections(t *testing.T) {
 			awaitClose(t, closed)
 		}
 	}()
+	var baseline int
 	for i := 0; i < count; i++ {
+		if i == 1 {
+			baseline = goroutineFloor(t)
+		}
 		nc, br, _ := rawClient(t, addr, "")
 		clients = append(clients, nc)
 		select {
@@ -88,10 +91,13 @@ func TestIdle5000Connections(t *testing.T) {
 			t.Fatal("readiness pong missing")
 		}
 	}
-	if growth := goroutines() - baseline; growth > 50 {
-		t.Fatalf("5000 idle sockets added %d goroutines (max 50)", growth)
+	// The engine's L+2 startup population, the shared upgrade reactor sit in the baseline;
+	// transient workers (including the one that served the first connection) drain inside the 3s min-window;
+	// the ceiling is host-size independent with a deterministic leak floor of 3 goroutines.
+	if growth := goroutineFloor(t) - baseline; growth > 2 {
+		t.Fatalf("5000 idle sockets added %d goroutines over the drained baseline (max 2)", growth)
 	} else {
-		t.Logf("5000 idle sockets added %d goroutines", growth)
+		t.Logf("5000 idle sockets added %d goroutines over the drained baseline", growth)
 	}
 }
 
