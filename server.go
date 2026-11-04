@@ -157,22 +157,21 @@ func (s *Server) Serve(l net.Listener) error {
 	return err
 }
 
-// ServeAll serves requests on every listener, closing each listener when its
-// acceptance stops. Engine-eligible listeners share one native HTTP/1 engine
-// — one loop group sized by runtime.GOMAXPROCS(0), one worker pool per
-// reactor, one deadline wheel — so N listeners pay one engine's scheduling
-// cost instead of N engines'. Listeners Serve would hand to net/http are
-// served by net/http exactly as Serve serves them.
+// ServeAll serves requests on every listener. Engine-eligible listeners
+// share one native HTTP/1 engine — one loop group sized by
+// runtime.GOMAXPROCS(0), one worker pool per reactor, one deadline wheel —
+// so N listeners pay one engine's scheduling cost instead of N engines'.
+// Every engine-eligible listener is reserved before any acceptance starts
+// and is closed when ServeAll returns, like Serve; listeners Serve would
+// hand to net/http are served by net/http and keep its listener semantics.
 //
-// BaseContext is called once per listener, and connections adopted from a
-// listener carry that listener's base context. A permanent accept error on
-// one listener stops only that listener's acceptance; ServeAll returns when
-// every listener has stopped, with the errors joined. It always returns a
-// non-nil error, ErrServerClosed after Shutdown or Close.
+// BaseContext is called once per listener before acceptance starts, and
+// connections adopted from a listener carry that listener's base context. A
+// permanent accept error on one listener stops only that listener's
+// acceptance; ServeAll returns when every listener has stopped, with the
+// errors joined. It always returns a non-nil error, ErrServerClosed after
+// Shutdown or Close.
 func (s *Server) ServeAll(listeners ...net.Listener) error {
-	if s.shutting.Load() {
-		return ErrServerClosed
-	}
 	if len(listeners) == 0 {
 		return errors.New("hoe: ServeAll requires at least one listener")
 	}
@@ -184,6 +183,18 @@ func (s *Server) ServeAll(listeners ...net.Listener) error {
 		} else {
 			stdListeners = append(stdListeners, l)
 		}
+	}
+	// Like Serve, ServeAll takes over every engine-eligible listener and
+	// closes it on return, the early returns below included. The accept
+	// loops close them again on the normal path; a second Close of an
+	// already-closed listener is harmless.
+	defer func() {
+		for _, tcp := range engineListeners {
+			tcp.Close()
+		}
+	}()
+	if s.shutting.Load() {
+		return ErrServerClosed
 	}
 	var eng *conn.Engine
 	if len(engineListeners) != 0 {
@@ -211,19 +222,19 @@ func (s *Server) ServeAll(listeners ...net.Listener) error {
 	}
 	var wg sync.WaitGroup
 	errs := make(chan error, len(listeners))
-	for _, tcp := range engineListeners {
+	if eng != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs <- eng.Serve(tcp)
+			errs <- eng.ServeAll(engineListeners...)
 		}()
 	}
 	for _, l := range stdListeners {
 		wg.Add(1)
-		go func() {
+		go func(l net.Listener) {
 			defer wg.Done()
 			errs <- s.serving().Serve(l)
-		}()
+		}(l)
 	}
 	wg.Wait()
 	close(errs)

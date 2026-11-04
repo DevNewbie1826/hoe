@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -394,4 +395,76 @@ func TestServeAllClose(t *testing.T) {
 	waitUntil(t, "worker release", func() bool { return goroutineFrames("internal/sched.(*Pool).run(") == 0 })
 	waitUntil(t, "engine registry release", func() bool { return conn.SnapshotResources().Engines == 0 })
 	waitUntil(t, "goroutine baseline", func() bool { return runtime.NumGoroutine() <= before })
+}
+
+// A-1 regression (adversarial finding A-1): a listener whose acceptance
+// ends immediately must not retire the shared engine while a later listener
+// is still being reserved. The dead listener's accept loop ends at once; the
+// live listener's BaseContext delays its own reservation past that point.
+func TestServeAllSurvivesStartupListenerOrder(t *testing.T) {
+	dead, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.Close()
+	if err := dead.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var delayed atomic.Bool
+	s := &Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}),
+		BaseContext: func(l net.Listener) context.Context {
+			if l.Addr().String() == live.Addr().String() && !delayed.Swap(true) {
+				time.Sleep(100 * time.Millisecond)
+			}
+			return context.Background()
+		},
+	}
+	errc := make(chan error, 1)
+	go func() { errc <- s.ServeAll(dead, live) }()
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	res, err := client.Get("http://" + live.Addr().String() + "/echo")
+	if err != nil {
+		t.Fatalf("live listener abandoned by the shared engine: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", res.StatusCode)
+	}
+	s.Close()
+	// The dead listener's accept error is joined into ServeAll's return;
+	// this test's contract is only that the live listener kept serving.
+	<-errc
+}
+
+// A-2 regression (sweep row S / adversarial A-2): ServeAll closes every
+// engine-eligible listener on every return path, like Serve.
+func TestServeAllEarlyReturnClosesListeners(t *testing.T) {
+	var s Server
+	l1, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	l2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if err := s.ServeAll(l1, l2); err != ErrServerClosed {
+		t.Fatalf("ServeAll = %v, want ErrServerClosed", err)
+	}
+	for i, l := range []net.Listener{l1, l2} {
+		d := net.Dialer{Timeout: 500 * time.Millisecond}
+		c, dialErr := d.Dial("tcp", l.Addr().String())
+		if dialErr == nil {
+			c.Close()
+			t.Errorf("listener %d still accepts after ServeAll returned", i)
+		}
+	}
 }

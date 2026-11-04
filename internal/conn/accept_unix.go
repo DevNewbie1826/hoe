@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -18,12 +19,11 @@ type listenerState struct {
 	adoptErr error // guarded by Engine.mu
 }
 
-// Serve accepts on the caller's listener and transfers sockets to the
-// shared loops; concurrent calls serve different listeners through one
-// group. It returns when that listener's acceptance stops, independently of
-// active request completion. Connections adopted here carry this listener's
-// BaseContext, and an adoption failure stops only this listener.
-func (e *Engine) Serve(l *net.TCPListener) (serveErr error) {
+// reserve creates l's listener state, calling BaseContext once, and
+// registers it under one lock. Registering before any acceptance starts is
+// what keeps a listener that ends immediately from retiring the engine
+// while its siblings are still being reserved.
+func (e *Engine) reserve(l *net.TCPListener) (*listenerState, error) {
 	base := context.Background()
 	if e.server.BaseContext != nil {
 		base = e.server.BaseContext(l)
@@ -34,12 +34,63 @@ func (e *Engine) Serve(l *net.TCPListener) (serveErr error) {
 	base = context.WithValue(base, http.ServerContextKey, e.server)
 	st := &listenerState{base: base}
 	e.mu.Lock()
+	defer e.mu.Unlock()
 	if e.stopping.Load() {
-		e.mu.Unlock()
-		return http.ErrServerClosed
+		return nil, http.ErrServerClosed
 	}
 	e.listeners[l] = st
-	e.mu.Unlock()
+	return st, nil
+}
+
+// Serve accepts on the caller's listener and transfers sockets to the
+// shared loops; concurrent calls serve different listeners through one
+// group. It returns when that listener's acceptance stops, independently of
+// active request completion. Connections adopted here carry this listener's
+// BaseContext, and an adoption failure stops only this listener.
+func (e *Engine) Serve(l *net.TCPListener) error {
+	st, err := e.reserve(l)
+	if err != nil {
+		return err
+	}
+	return e.serveReserved(l, st)
+}
+
+// ServeAll reserves every listener before any acceptance starts, then
+// serves them concurrently, and returns the joined per-listener errors. A
+// listener whose acceptance ends immediately cannot publish acceptance-stop
+// while later listeners are still reserving.
+func (e *Engine) ServeAll(ls ...*net.TCPListener) error {
+	states := make([]*listenerState, len(ls))
+	for i, l := range ls {
+		st, err := e.reserve(l)
+		if err != nil {
+			for j := 0; j < i; j++ {
+				e.endListener(ls[j])
+			}
+			return err
+		}
+		states[i] = st
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, len(ls))
+	for i, l := range ls {
+		wg.Add(1)
+		go func(l *net.TCPListener, st *listenerState) {
+			defer wg.Done()
+			errs <- e.serveReserved(l, st)
+		}(l, states[i])
+	}
+	wg.Wait()
+	close(errs)
+	var err error
+	for serveErr := range errs {
+		err = errors.Join(err, serveErr)
+	}
+	return err
+}
+
+// serveReserved runs one registered listener's accept loop to its end.
+func (e *Engine) serveReserved(l *net.TCPListener, st *listenerState) (serveErr error) {
 	defer func() {
 		e.adoptions.Wait()
 		e.mu.Lock()
