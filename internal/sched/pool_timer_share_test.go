@@ -98,3 +98,77 @@ func poolRunTimerAllocBytes() int64 {
 	}
 	return sum
 }
+
+// TestIdleTimerFreeListCapsAndClearsOnClose pins the free-list bound. A
+// burst larger than idleTimerFreeListCap expires down to that cap, and
+// Close leaves the list empty. The second bubble closes while workers
+// still hold timers, so a release after Close must drop, not append.
+// Sleep advances the synctest fake clock; it is not a wall-clock wait.
+func TestIdleTimerFreeListCapsAndClearsOnClose(t *testing.T) {
+	const burst = idleTimerFreeListCap + 8
+
+	t.Run("expiry", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			p := New(time.Hour)
+			defer p.Close()
+			submitIdleBurst(t, p, burst)
+			if got := p.Workers(); got != burst {
+				t.Fatalf("idle workers=%d, want %d", got, burst)
+			}
+			time.Sleep(time.Hour + time.Second)
+			synctest.Wait()
+			if got := p.Workers(); got != 0 {
+				t.Fatalf("expired idle workers retained: %d", got)
+			}
+			if got := idleTimerFreeListLen(p); got != idleTimerFreeListCap {
+				t.Fatalf("free list len=%d after %d concurrent expiries, want cap %d", got, burst, idleTimerFreeListCap)
+			}
+			p.Close()
+			if got := idleTimerFreeListLen(p); got != 0 {
+				t.Fatalf("free list len=%d after Close, want 0", got)
+			}
+		})
+	})
+
+	t.Run("release after Close", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			p := New(time.Hour)
+			defer p.Close()
+			submitIdleBurst(t, p, burst)
+			if got := p.Workers(); got != burst {
+				t.Fatalf("idle workers=%d, want %d", got, burst)
+			}
+			p.Close()
+			if got := idleTimerFreeListLen(p); got != 0 {
+				t.Fatalf("release after Close left %d timers, want 0", got)
+			}
+		})
+	})
+}
+
+func submitIdleBurst(t *testing.T, p *Pool, n int) {
+	t.Helper()
+	// Park every task until all have entered. A tight Submit loop otherwise
+	// reuses workers that already went idle, so the burst is not concurrent.
+	entered := make(chan struct{}, n)
+	release := make(chan struct{})
+	for range n {
+		if !p.Submit(func() {
+			entered <- struct{}{}
+			<-release
+		}) {
+			t.Fatal("task rejected")
+		}
+	}
+	for range n {
+		<-entered
+	}
+	close(release)
+	synctest.Wait()
+}
+
+func idleTimerFreeListLen(p *Pool) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.timers)
+}

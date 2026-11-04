@@ -6,6 +6,10 @@ import (
 	"time"
 )
 
+// idleTimerFreeListCap is the most stopped idle timers one pool retains.
+// A release past the cap drops the timer after Stop and drain.
+const idleTimerFreeListCap = 8
+
 type worker struct {
 	work     chan func()
 	idle     bool
@@ -26,7 +30,8 @@ type Pool struct {
 	// fire on the clock that armed it, so timers never cross pools. The
 	// list holds stopped, drained timers only: releaseIdleTimer publishes
 	// a timer after Stop and drain, and acquireIdleTimer rearms it, so a
-	// later idle wait deterministically reuses an earlier one.
+	// later idle wait deterministically reuses an earlier one. The list
+	// keeps at most idleTimerFreeListCap timers; Close drops it.
 	timers []*time.Timer
 }
 
@@ -54,6 +59,12 @@ func (p *Pool) releaseIdleTimer(t *time.Timer) {
 	default:
 	}
 	p.mu.Lock()
+	// A closed pool must not republish, and the free list must not grow
+	// past the cap. Stop and drain already ran, so dropping t is final.
+	if p.closed || len(p.timers) >= idleTimerFreeListCap {
+		p.mu.Unlock()
+		return
+	}
 	p.timers = append(p.timers, t)
 	p.mu.Unlock()
 }
@@ -172,6 +183,9 @@ func (p *Pool) Close() {
 		clear(p.idle)
 		p.idle = nil
 	}
+	// Nil before Wait so a release that loses the race cannot append
+	// onto a list Close already dropped.
+	p.timers = nil
 	p.mu.Unlock()
 	p.wg.Wait()
 }
