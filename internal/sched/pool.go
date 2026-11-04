@@ -3,13 +3,8 @@ package sched
 
 import (
 	"sync"
-	"sync/atomic"
 	"time"
 )
-
-// idleTimersCreated counts idle-timer allocations; the allocation-shape
-// guard reads it to prove a worker blocked in a task holds no idle timer.
-var idleTimersCreated atomic.Int64
 
 type worker struct {
 	work     chan func()
@@ -37,7 +32,6 @@ func (p *Pool) acquireIdleTimer() *time.Timer {
 		t.Reset(p.expiry)
 		return t
 	}
-	idleTimersCreated.Add(1)
 	return time.NewTimer(p.expiry)
 }
 

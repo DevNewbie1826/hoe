@@ -21,6 +21,18 @@ func TestBlockedWorkersRetainNoTimer(t *testing.T) {
 		close(release)
 		p.Close()
 	})
+	// Delta, not an absolute zero: timers allocated by earlier tests stay in
+	// the in-use profile across one GC (sync.Pool victim cache; under -race a
+	// dropped Put). Publish until that baseline stops moving, then require
+	// these blocked workers to add none.
+	before := runTimerBytes()
+	for range 4 {
+		next := runTimerBytes()
+		if next == before {
+			break
+		}
+		before = next
+	}
 	entered := make(chan struct{}, 8)
 	for range 8 {
 		if !p.Submit(func() {
@@ -33,8 +45,9 @@ func TestBlockedWorkersRetainNoTimer(t *testing.T) {
 	for range 8 {
 		await(t, entered)
 	}
-	if got := runTimerBytes(); got != 0 {
-		t.Fatalf("blocked workers retain %d bytes allocated by Pool.run, want 0", got)
+	after := runTimerBytes()
+	if got := before - after; got != 0 {
+		t.Fatalf("blocked workers retain %d bytes allocated by Pool.run, want 0", after-before)
 	}
 }
 
