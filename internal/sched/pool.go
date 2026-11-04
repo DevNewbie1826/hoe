@@ -6,6 +6,10 @@ import (
 	"time"
 )
 
+// idleTimerFreeListCap is the most stopped idle timers one pool retains.
+// A release past the cap drops the timer after Stop and drain.
+const idleTimerFreeListCap = 8
+
 type worker struct {
 	work     chan func()
 	idle     bool
@@ -22,6 +26,47 @@ type Pool struct {
 	closed bool
 	count  int
 	wg     sync.WaitGroup
+	// timers shares idle timers across this pool's workers. A timer must
+	// fire on the clock that armed it, so timers never cross pools. The
+	// list holds stopped, drained timers only: releaseIdleTimer publishes
+	// a timer after Stop and drain, and acquireIdleTimer rearms it, so a
+	// later idle wait deterministically reuses an earlier one. The list
+	// keeps at most idleTimerFreeListCap timers; Close drops it.
+	timers []*time.Timer
+}
+
+// acquireIdleTimer returns an armed idle timer, deterministically reusing
+// a timer this pool still holds.
+func (p *Pool) acquireIdleTimer() *time.Timer {
+	p.mu.Lock()
+	if n := len(p.timers); n != 0 {
+		t := p.timers[n-1]
+		p.timers[n-1] = nil
+		p.timers = p.timers[:n-1]
+		p.mu.Unlock()
+		t.Reset(p.expiry)
+		return t
+	}
+	p.mu.Unlock()
+	return time.NewTimer(p.expiry)
+}
+
+// releaseIdleTimer stops t, drains a fired-but-unread value, and shares t.
+func (p *Pool) releaseIdleTimer(t *time.Timer) {
+	t.Stop()
+	select {
+	case <-t.C:
+	default:
+	}
+	p.mu.Lock()
+	// A closed pool must not republish, and the free list must not grow
+	// past the cap. Stop and drain already ran, so dropping t is final.
+	if p.closed || len(p.timers) >= idleTimerFreeListCap {
+		p.mu.Unlock()
+		return
+	}
+	p.timers = append(p.timers, t)
+	p.mu.Unlock()
 }
 
 // New creates a pool whose idle workers expire after idleTimeout.
@@ -77,8 +122,6 @@ func (p *Pool) run(w *worker, task func()) {
 		}
 		p.mu.Unlock()
 	}()
-	timer := time.NewTimer(p.expiry)
-	defer timer.Stop()
 	for {
 		task()
 		p.mu.Lock()
@@ -89,13 +132,15 @@ func (p *Pool) run(w *worker, task func()) {
 		w.idle = true
 		p.idle = append(p.idle, w)
 		p.mu.Unlock()
-		timer.Reset(p.expiry)
+		// The idle timer exists only between tasks: a worker blocked in a
+		// handler holds no timer, and idle waits share stopped timers.
+		timer := p.acquireIdleTimer()
 		select {
 		case next, ok := <-w.work:
+			p.releaseIdleTimer(timer)
 			if !ok {
 				return
 			}
-			timer.Stop()
 			task = next
 		case <-timer.C:
 			p.mu.Lock()
@@ -110,10 +155,12 @@ func (p *Pool) run(w *worker, task func()) {
 				}
 				w.idle = false
 				p.mu.Unlock()
+				p.releaseIdleTimer(timer)
 				return
 			}
 			// Submission or Close won the lock while the timer fired.
 			p.mu.Unlock()
+			p.releaseIdleTimer(timer)
 			next, ok := <-w.work
 			if !ok {
 				return
@@ -136,6 +183,9 @@ func (p *Pool) Close() {
 		clear(p.idle)
 		p.idle = nil
 	}
+	// Nil before Wait so a release that loses the race cannot append
+	// onto a list Close already dropped.
+	p.timers = nil
 	p.mu.Unlock()
 	p.wg.Wait()
 }

@@ -5,6 +5,7 @@ package loop
 import (
 	"errors"
 	"net"
+	"slices"
 	"syscall"
 
 	"github.com/DevNewbie1826/hoe/internal/poll"
@@ -22,12 +23,9 @@ func (l *reactor) run() {
 		// Resolve all identities before commands/accepts can reuse descriptors.
 		listeners := make([]int, 0)
 		for _, e := range events {
-			owner := l.at(e.FD)
-			if owner == nil || owner.token != e.Token {
-				continue
-			}
-			if owner.conn == nil {
-				if e.Read {
+			owner := l.at(e.Token)
+			if owner == nil {
+				if e.Read && l.listenerAt(e.FD, e.Token) {
 					listeners = append(listeners, e.FD)
 				}
 				continue
@@ -47,7 +45,7 @@ func (l *reactor) run() {
 			return
 		}
 		for _, fd := range listeners {
-			if e := l.at(fd); e != nil && e.conn == nil {
+			if l.hasListener(fd) {
 				l.accept(fd)
 			}
 		}
@@ -68,28 +66,28 @@ func (l *reactor) drain() bool {
 		} else {
 			switch cmd.kind {
 			case stopListenersCommand:
-				for fd, e := range l.table {
-					if e != nil && e.conn == nil {
-						err = errors.Join(err, l.p.Delete(fd), syscall.Close(fd))
-						l.table[fd] = nil
-					}
-				}
+				err = errors.Join(err, l.closeListeners())
 			case listenCommand:
 				if l.g.closed.Load() {
 					err = net.ErrClosed
 					break
 				}
-				token := l.g.tokens.Add(1)
-				err = l.p.Add(cmd.fd, token, true, false)
-				if err == nil {
-					l.put(cmd.fd, &entry{token: token})
-				}
+				err = l.registerListener(cmd.fd)
 			case adoptCommand:
 				c := cmd.conn
 				if l.g.closed.Load() {
 					err = net.ErrClosed
 				} else {
-					err = l.p.Add(c.fd, c.token, true, false)
+					// The compact slot, not the descriptor, identifies this
+					// registration; republish its token before the poller sees
+					// it. An exhausted token space fails before a slot is
+					// taken, so the failure path below balances exactly as
+					// for a rejected Add.
+					var token uint64
+					token, err = l.registerConn(c)
+					if err == nil {
+						err = l.p.Add(c.fd, token, true, false)
+					}
 				}
 				if err != nil {
 					c.mu.Lock()
@@ -97,20 +95,22 @@ func (l *reactor) drain() bool {
 					close(c.done)
 					syscall.Close(c.fd)
 					c.mu.Unlock()
+					if c.token != 0 {
+						l.freeSlot(c.token)
+					}
 				} else {
-					l.put(c.fd, &entry{token: c.token, conn: c})
 					l.callback(c, func() { l.g.handler.OnOpen(c) })
 				}
 			case interestCommand:
 				c := cmd.conn
-				if e := l.at(c.fd); e == nil || e.conn != c {
+				if e := l.at(c.token); e == nil || e.conn != c {
 					err = net.ErrClosed
 				} else {
 					err = l.p.Modify(c.fd, c.token, cmd.read, cmd.write)
 				}
 			case closeCommand, detachCommand:
 				c := cmd.conn
-				if e := l.at(c.fd); e != nil && e.conn == c {
+				if e := l.at(c.token); e != nil && e.conn == c {
 					err = l.remove(c, cmd.kind == closeCommand, nil)
 				} else if cmd.kind == detachCommand {
 					err = net.ErrClosed
@@ -151,7 +151,7 @@ func (l *reactor) accept(fd int) {
 			continue
 		}
 		target := l.g.owner()
-		c := &Conn{loop: target, fd: n, token: l.g.tokens.Add(1), done: make(chan struct{})}
+		c := &Conn{loop: target, fd: n, done: make(chan struct{})}
 		if err := target.enqueue(&command{kind: adoptCommand, conn: c}); err != nil {
 			syscall.Close(n)
 		}
@@ -168,7 +168,7 @@ func (l *reactor) remove(c *Conn, closeFD bool, cause error) error {
 	if err != nil && !closeFD {
 		return err
 	}
-	l.table[c.fd] = nil
+	l.freeSlot(c.token)
 	c.closed = true
 	close(c.done)
 	if closeFD {
@@ -197,17 +197,30 @@ func (l *reactor) finish(cause error) {
 			cmd.complete(net.ErrClosed)
 		}
 	}
-	for fd, e := range l.table {
-		if e == nil {
-			continue
-		}
-		if e.conn == nil {
-			cause = errors.Join(cause, l.p.Delete(fd), syscall.Close(fd))
-			l.table[fd] = nil
-		} else {
-			cause = errors.Join(cause, l.remove(e.conn, true, cause))
+	// Close in descriptor order, as the fd-indexed sweep did, so shutdown
+	// callback order stays independent of registration-slot reuse.
+	type owned struct {
+		fd   int
+		conn *Conn
+	}
+	ownedFDs := make([]owned, 0, len(l.listeners)+len(l.slots))
+	for _, e := range l.listeners {
+		ownedFDs = append(ownedFDs, owned{fd: e.fd})
+	}
+	for _, e := range l.slots {
+		if e != nil {
+			ownedFDs = append(ownedFDs, owned{fd: e.conn.fd, conn: e.conn})
 		}
 	}
+	slices.SortFunc(ownedFDs, func(a, b owned) int { return a.fd - b.fd })
+	for _, o := range ownedFDs {
+		if o.conn == nil {
+			cause = errors.Join(cause, l.p.Delete(o.fd), syscall.Close(o.fd))
+		} else {
+			cause = errors.Join(cause, l.remove(o.conn, true, cause))
+		}
+	}
+	l.listeners = nil
 	l.dispatch()
 	l.err = errors.Join(cause, l.p.Close())
 }

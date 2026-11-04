@@ -77,6 +77,9 @@ func ReadRequest(in *bufio.Reader, maxHeaderBytes int) (*http.Request, error) {
 	}
 	var head []byte
 	firstLine := true
+	// lineStart is false while a line spans several full-buffer fragments: a
+	// trailing "\r\n" fragment of such a line is not a blank line.
+	lineStart := true
 	for {
 		fragment, err := in.ReadSlice('\n')
 		if int64(len(head))+int64(len(fragment)) > limit {
@@ -84,8 +87,11 @@ func ReadRequest(in *bufio.Reader, maxHeaderBytes int) (*http.Request, error) {
 		}
 		head = append(head, fragment...)
 		if errors.Is(err, bufio.ErrBufferFull) {
+			lineStart = false
 			continue
 		}
+		wholeLine := lineStart
+		lineStart = true
 		if err != nil {
 			if errors.Is(err, io.EOF) && len(head) > 0 {
 				r, parseErr := ParseHead(head, in)
@@ -106,7 +112,7 @@ func ReadRequest(in *bufio.Reader, maxHeaderBytes int) (*http.Request, error) {
 				return nil, classifyHeadError(err)
 			}
 		}
-		if bytes.Equal(fragment, []byte("\r\n")) || bytes.Equal(fragment, []byte("\n")) {
+		if wholeLine && (bytes.Equal(fragment, []byte("\r\n")) || bytes.Equal(fragment, []byte("\n"))) {
 			break
 		}
 	}

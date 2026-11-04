@@ -31,6 +31,7 @@ type Conn struct {
 	eof                         bool
 	bodyDone                    bool
 	serving                     bool
+	readerDemand                atomic.Bool // read rounds go big once a read fills the small reader
 	headStart                   time.Time
 	accepted                    time.Time
 	readDeadline, writeDeadline time.Time

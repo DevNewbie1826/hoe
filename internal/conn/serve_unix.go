@@ -19,13 +19,66 @@ import (
 	"github.com/DevNewbie1826/hoe/internal/http1"
 )
 
+const (
+	// smallReaderSize starts every connection's read rounds small; the
+	// reader grows to bigReaderSize only after a read fills the small
+	// buffer, so parked rounds retain one small backing.
+	smallReaderSize = 1024
+	bigReaderSize   = 4096
+)
+
 type requestIO struct {
-	in *bufio.Reader
+	in    *bufio.Reader
+	small bool
 }
 
-var requestIOPool = sync.Pool{New: func() any {
-	return &requestIO{in: bufio.NewReaderSize(nil, 4096)}
+var smallRequestIOPool = sync.Pool{New: func() any {
+	return &requestIO{in: bufio.NewReaderSize(nil, smallReaderSize), small: true}
 }}
+
+var bigRequestIOPool = sync.Pool{New: func() any {
+	return &requestIO{in: bufio.NewReaderSize(nil, bigReaderSize)}
+}}
+
+func acquireRequestIO(c *Conn) *requestIO {
+	if c.readerDemand.Load() {
+		return bigRequestIOPool.Get().(*requestIO)
+	}
+	return smallRequestIOPool.Get().(*requestIO)
+}
+
+func releaseRequestIO(b *requestIO) {
+	if b.small {
+		smallRequestIOPool.Put(b)
+		return
+	}
+	bigRequestIOPool.Put(b)
+}
+
+// source wraps small readers so real demand grows the connection; big
+// readers read the connection directly.
+func (b *requestIO) source(c *Conn) io.Reader {
+	if !b.small {
+		return c
+	}
+	return &demandReader{c: c}
+}
+
+// demandReader flags the connection the first time a read delivers the
+// small reader's full size: only then has a request read beyond the small
+// retention. Promoted full-size readers read through it too, so a body
+// moved off the small reader still marks demanding connections.
+type demandReader struct {
+	c *Conn
+}
+
+func (d *demandReader) Read(p []byte) (int, error) {
+	n, err := d.c.Read(p)
+	if n >= smallReaderSize {
+		d.c.readerDemand.Store(true)
+	}
+	return n, err
+}
 
 var corkWriterPool = sync.Pool{New: func() any {
 	return bufio.NewWriterSize(io.Discard, 64<<10)
@@ -107,15 +160,41 @@ func completeHead(p []byte) bool {
 	return bytes.Contains(p, []byte("\n\n")) || bytes.Contains(p, []byte("\n\r\n"))
 }
 
+// stashBuffered moves p ahead of any pending input under readMu so the
+// next read serves p first.
+func (c *Conn) stashBuffered(p []byte) {
+	c.readMu.Lock()
+	b := bufpool.Get(max(4096, len(p)+len(c.input)-c.offset))
+	n := copy(b, p)
+	n += copy(b[n:], c.input[c.offset:])
+	c.releaseInputLocked()
+	c.input = b[:n]
+	c.readMu.Unlock()
+}
+
+// growRequestIO swaps the round's reader for a full-size one. Buffered
+// bytes move ahead of pending input so parsing results stay identical.
+func (c *Conn) growRequestIO(buffers *requestIO, source io.Reader) *requestIO {
+	grown := bigRequestIOPool.Get().(*requestIO)
+	if carry := buffers.in.Buffered(); carry > 0 {
+		p, _ := buffers.in.Peek(carry)
+		c.stashBuffered(p)
+	}
+	grown.in.Reset(source)
+	buffers.in.Reset(nil)
+	releaseRequestIO(buffers)
+	return grown
+}
+
 func (c *Conn) round() {
 	var buffers *requestIO
 	var in *bufio.Reader
 	output := &roundOutput{Conn: c}
 	defer func() {
 		if buffers != nil {
-			in.Reset(nil)
+			buffers.in.Reset(nil)
 			output.ReleaseResponseOutput()
-			requestIOPool.Put(buffers)
+			releaseRequestIO(buffers)
 		}
 	}()
 	defer func() {
@@ -146,13 +225,7 @@ func (c *Conn) round() {
 				c.startHead(false)
 				c.setState(http.StateActive)
 			} else {
-				c.readMu.Lock()
-				b := bufpool.Get(max(4096, len(p)+len(c.input)-c.offset))
-				n := copy(b, p)
-				n += copy(b[n:], c.input[c.offset:])
-				c.releaseInputLocked()
-				c.input = b[:n]
-				c.readMu.Unlock()
+				c.stashBuffered(p)
 				in.Discard(len(p))
 			}
 		}
@@ -182,12 +255,20 @@ func (c *Conn) round() {
 		}
 		first := buffers == nil
 		if first {
-			buffers = requestIOPool.Get().(*requestIO)
+			buffers = acquireRequestIO(c)
 			in = buffers.in
-			in.Reset(c)
+			in.Reset(buffers.source(c))
 		}
-		if !c.serveRequest(in, output, first) {
+		served := c.serveRequest(&buffers, output, first)
+		in = buffers.in
+		if !served {
 			return
+		}
+		if buffers.small && c.readerDemand.Load() {
+			// A read filled the small buffer: this connection needs the
+			// full-size reader.
+			buffers = c.growRequestIO(buffers, c)
+			in = buffers.in
 		}
 	}
 }
@@ -259,7 +340,10 @@ func (c *Conn) readHead() (bool, error) {
 	}
 }
 
-func (c *Conn) serveRequest(in *bufio.Reader, output *roundOutput, first bool) bool {
+// serveRequest publishes a promoted reader through bp before the handler
+// runs, so a panic unwinds with round() owning exactly the live reader.
+func (c *Conn) serveRequest(bp **requestIO, output *roundOutput, first bool) bool {
+	in := (*bp).in
 	r, err := http1.ReadRequest(in, c.engine.server.MaxHeaderBytes)
 	if err != nil {
 		http1.WriteError(c, err)
@@ -278,6 +362,17 @@ func (c *Conn) serveRequest(in *bufio.Reader, output *roundOutput, first bool) b
 			}
 			output.acquireCork()
 		}
+	}
+	if (*bp).small && len(r.TransferEncoding) > 0 {
+		// Chunked framing is bounded by the reader's capacity: chunk
+		// extension lines and trailers parse through ReadSlice and Peek on
+		// this reader, so the small reader would reject framing the
+		// pre-compaction full-size reader accepted. Promote before the
+		// first body byte is read; bodyless and fixed-length requests keep
+		// the small reader and its retention win.
+		*bp = c.growRequestIO(*bp, &demandReader{c})
+		in = (*bp).in
+		http1.RebindBodyReader(r, in)
 	}
 	cancel := http1.BindContext(r, c.base)
 	r.RemoteAddr = c.remoteName
