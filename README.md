@@ -64,6 +64,14 @@ log.Fatal(srv.ListenAndServe())
 log.Fatal(hoe.FromStd(stdServer).ListenAndServe())
 ```
 
+When serving the same application on multiple listeners, use `ServeAll` to share one engine across eligible listeners. In a 2-CPU echo test, 50 per-port engines measured 1.48 s p99 latency; one shared engine measured 313 ms.
+
+```go
+log.Fatal(srv.ServeAll(listener1, listener2))
+```
+
+`BaseContext` is called once per listener, and each listener's connections use its own base context. A permanent accept error stops only that listener; `ServeAll` returns when all listeners stop.
+
 ## Protocols and caveats
 
 | Traffic | Served by |
