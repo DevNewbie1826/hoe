@@ -4,7 +4,9 @@ package loop
 
 import (
 	"errors"
+	"fmt"
 	"net"
+	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -18,6 +20,7 @@ import (
 type Group struct {
 	loops     []*reactor
 	handler   Handler
+	placement placementPolicy
 	next      atomic.Uint64
 	closed    atomic.Bool
 	closeOnce sync.Once
@@ -29,11 +32,15 @@ func New(cfg Config) (*Group, error) {
 	if cfg.Handler == nil || cfg.Loops < 0 {
 		return nil, syscall.EINVAL
 	}
+	placement, err := placementFromEnv()
+	if err != nil {
+		return nil, err
+	}
 	n := cfg.Loops
 	if n == 0 {
 		n = DefaultLoops()
 	}
-	g := &Group{handler: cfg.Handler}
+	g := &Group{handler: cfg.Handler, placement: placement}
 	for range n {
 		p, err := poll.New()
 		if err != nil {
@@ -51,7 +58,42 @@ func New(cfg Config) (*Group, error) {
 	return g, nil
 }
 
-func (g *Group) owner() *reactor { return g.loops[(g.next.Add(1)-1)%uint64(len(g.loops))] }
+// placementPolicy selects the reactor that owns an adopted descriptor.
+type placementPolicy uint8
+
+const (
+	// roundRobin rotates a shared counter and ignores the descriptor value;
+	// the historical default and the zero value of placementPolicy.
+	roundRobin placementPolicy = iota
+	// fdModulo derives the owner directly from the descriptor value.
+	fdModulo
+)
+
+// placementFromEnv resolves HOE_LOOP_PLACEMENT ("roundrobin" when unset,
+// "fdmodulo") so fixed-protocol measurements and tests can compare placement
+// policies without source edits. Any other value fails New loudly rather
+// than silently measuring the wrong policy.
+func placementFromEnv() (placementPolicy, error) {
+	switch v := os.Getenv("HOE_LOOP_PLACEMENT"); v {
+	case "", "roundrobin":
+		return roundRobin, nil
+	case "fdmodulo":
+		return fdModulo, nil
+	default:
+		return 0, fmt.Errorf("loop: unknown HOE_LOOP_PLACEMENT %q", v)
+	}
+}
+
+// owner returns the reactor that owns fd under the group's placement
+// policy. Any descriptor value is safe, including the negative sentinels
+// failure tests adopt: the modulus keeps the index inside the loop set.
+func (g *Group) owner(fd int) *reactor {
+	n := uint64(len(g.loops))
+	if g.placement == fdModulo {
+		return g.loops[uint64(fd)%n]
+	}
+	return g.loops[(g.next.Add(1)-1)%n]
+}
 
 // Listen transfers ownership of a nonblocking close-on-exec listener fd on
 // success. The caller retains ownership if registration fails.
@@ -59,13 +101,13 @@ func (g *Group) Listen(fd int) error {
 	if g.closed.Load() {
 		return net.ErrClosed
 	}
-	return g.owner().call(&command{kind: listenCommand, fd: fd})
+	return g.owner(fd).call(&command{kind: listenCommand, fd: fd})
 }
 
 // Adopt takes ownership of an accepted nonblocking close-on-exec socket.
 // It closes the descriptor even if registration fails.
 func (g *Group) Adopt(fd int) error {
-	c := &Conn{loop: g.owner(), fd: fd, done: make(chan struct{})}
+	c := &Conn{loop: g.owner(fd), fd: fd, done: make(chan struct{})}
 	cmd := &command{kind: adoptCommand, conn: c, reply: make(chan error, 1)}
 	if err := c.loop.enqueue(cmd); err != nil {
 		return errors.Join(err, syscall.Close(fd))
@@ -76,7 +118,7 @@ func (g *Group) Adopt(fd int) error {
 // AdoptAsync transfers ownership and reports registration completion without
 // making the caller wait for the destination reactor.
 func (g *Group) AdoptAsync(fd int, complete func(error)) error {
-	c := &Conn{loop: g.owner(), fd: fd, done: make(chan struct{})}
+	c := &Conn{loop: g.owner(fd), fd: fd, done: make(chan struct{})}
 	if err := c.loop.enqueue(&command{kind: adoptCommand, conn: c, complete: complete}); err != nil {
 		return errors.Join(err, syscall.Close(fd))
 	}
