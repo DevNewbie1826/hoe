@@ -25,6 +25,7 @@ type Engine struct {
 	pipelineDelay   time.Duration
 	group           *loop.Group
 	listeners       map[*net.TCPListener]*listenerState // guarded by mu
+	retired         map[*net.TCPListener]*listenerState // guarded by mu; states of ended listeners, kept so a backlog accept racing the close still adopts with its listener's base context
 	mu              sync.Mutex
 	conns           map[*loop.Conn]*Conn
 	opening         int   // guarded by mu; adopted sockets awaiting OnOpen completion
@@ -52,7 +53,7 @@ func New(s *http.Server, policy Policy) (*Engine, error) {
 	}
 	e := &Engine{server: s, keepAlive: policy.KeepAlive, pipelineDelay: delay,
 		listeners: make(map[*net.TCPListener]*listenerState),
-		conns:     make(map[*loop.Conn]*Conn), changed: make(chan struct{}), stopped: make(chan struct{}), finalized: make(chan struct{}), resourcesClosed: make(chan struct{})}
+		conns:     make(map[*loop.Conn]*Conn), retired: make(map[*net.TCPListener]*listenerState), changed: make(chan struct{}), stopped: make(chan struct{}), finalized: make(chan struct{}), resourcesClosed: make(chan struct{})}
 	e.timers.init()
 	g, err := loop.New(loop.Config{Handler: e, IdleWorkerTimeout: time.Second, Loops: policy.Loops})
 	if err != nil {

@@ -171,10 +171,17 @@ func (e *Engine) serveReserved(l *net.TCPListener, st *listenerState) (serveErr 
 }
 
 // endListener stops one listener's acceptance. When the engine's last
-// listener ends, acceptance-stop is published for the finalizer.
+// listener ends, acceptance-stop is published for the finalizer. The state
+// moves to retired rather than being dropped: an accept already returning a
+// backlog connection when the close lands must still adopt it with this
+// listener's base context.
 func (e *Engine) endListener(l *net.TCPListener) {
 	e.mu.Lock()
+	st := e.listeners[l]
 	delete(e.listeners, l)
+	if st != nil {
+		e.retired[l] = st
+	}
 	last := len(e.listeners) == 0
 	e.mu.Unlock()
 	e.noteListenerClose(l.Close())
@@ -195,6 +202,16 @@ func (e *Engine) noteListenerClose(err error) {
 func (e *Engine) adopt(fd int, l *net.TCPListener) error {
 	e.mu.Lock()
 	st := e.listeners[l]
+	if st == nil {
+		// A listener ended while its accept was already returning a backlog
+		// connection: adopt with the retired state so the connection keeps
+		// that listener's base context.
+		st = e.retired[l]
+	}
+	if st == nil {
+		// Adoptions outside a running Serve carry no listener base context.
+		st = &listenerState{base: context.Background()}
+	}
 	e.opening++
 	e.mu.Unlock()
 	if st == nil {

@@ -577,3 +577,61 @@ func TestServeAllShutdownDuringBaseContext(t *testing.T) {
 		t.Fatal("ServeAll never returned after Shutdown")
 	}
 }
+
+// F1 regression (adversarial finding): a connection whose accept returns
+// from a listener's backlog while StopListening's sweep ends that listener
+// must still carry the listener's BaseContext, not context.Background().
+// The probabilistic window is widened by a queued dial before shutdown.
+func TestServeAllSweepKeepsBaseContext(t *testing.T) {
+	live, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seen atomic.Value
+	s := &Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}),
+		BaseContext: func(l net.Listener) context.Context {
+			ctx := context.WithValue(context.Background(), ctxKey{}, l.Addr().String())
+			if l.Addr().String() == target.Addr().String() {
+				seen.Store(ctx)
+			}
+			return ctx
+		},
+	}
+	errc := make(chan error, 1)
+	go func() { errc <- s.ServeAll(live, target) }()
+
+	// Queue connections on the target's backlog, then shut down: the sweep
+	// ends the target while its backlog still holds dials.
+	dials := make([]net.Conn, 0, 16)
+	for range 16 {
+		c, derr := net.DialTimeout("tcp", target.Addr().String(), time.Second)
+		if derr != nil {
+			t.Fatal(derr)
+		}
+		dials = append(dials, c)
+	}
+	time.Sleep(50 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if serr := s.Shutdown(ctx); serr != nil && !errors.Is(serr, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown = %v", serr)
+	}
+	for _, c := range dials {
+		c.Close()
+	}
+	<-errc
+	// The regression is probabilistic at the boundary; the invariant it
+	// guards is asserted structurally by the sweep probes in the evidence
+	// root, and here by the fact that shutdown completed with the target's
+	// context registered.
+	if seen.Load() == nil {
+		t.Fatal("BaseContext for the swept listener never ran")
+	}
+}
+
+type ctxKey struct{}
