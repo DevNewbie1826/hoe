@@ -184,13 +184,13 @@ func (s *Server) ServeAll(listeners ...net.Listener) error {
 			stdListeners = append(stdListeners, l)
 		}
 	}
-	// Like Serve, ServeAll takes over every engine-eligible listener and
-	// closes it on return, the early returns below included. The accept
-	// loops close them again on the normal path; a second Close of an
-	// already-closed listener is harmless.
+	// Like Serve and like net/http's Serve, ServeAll takes over every handed
+	// listener and closes it on return, the early returns below included.
+	// The accept loops and net/http's Serve close them again on the normal
+	// path; a second Close of an already-closed listener is harmless.
 	defer func() {
-		for _, tcp := range engineListeners {
-			tcp.Close()
+		for _, l := range listeners {
+			l.Close()
 		}
 	}()
 	if s.shutting.Load() {

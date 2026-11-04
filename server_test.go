@@ -455,8 +455,14 @@ func TestServeAllEarlyReturnClosesListeners(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A unix listener is engine-ineligible and rides the net/http branch;
+	// ServeAll must close it on the early return too, like net/http's Serve.
+	l3, err := net.Listen("unix", t.TempDir()+"/s.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
 	s.Close()
-	if err := s.ServeAll(l1, l2); err != ErrServerClosed {
+	if err := s.ServeAll(l1, l2, l3); err != ErrServerClosed {
 		t.Fatalf("ServeAll = %v, want ErrServerClosed", err)
 	}
 	for i, l := range []net.Listener{l1, l2} {
@@ -466,5 +472,10 @@ func TestServeAllEarlyReturnClosesListeners(t *testing.T) {
 			c.Close()
 			t.Errorf("listener %d still accepts after ServeAll returned", i)
 		}
+	}
+	d := net.Dialer{Timeout: 500 * time.Millisecond}
+	if c, dialErr := d.Dial("unix", l3.Addr().String()); dialErr == nil {
+		c.Close()
+		t.Error("unix listener still accepts after ServeAll returned")
 	}
 }
