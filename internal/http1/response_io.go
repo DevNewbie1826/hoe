@@ -13,8 +13,19 @@ import (
 
 type responseChunks struct{ w *Response }
 
+// A released output writer must retain bufio.Writer's sticky error behavior.
+type failedResponseOutput struct{ err error }
+
+func (w failedResponseOutput) Write([]byte) (int, error) { return 0, w.err }
+
 func (c responseChunks) Write(p []byte) (int, error) {
 	w := c.w
+	w.acquireOutput()
+	if len(p) >= 2048 && w.err == nil {
+		if owner, ok := w.transport.(responseOutputOwner); ok {
+			w.out = owner.GrowResponseOutput()
+		}
+	}
 	w.sendHead(p)
 	if w.req.Method == "HEAD" {
 		return len(p), w.err
@@ -49,6 +60,7 @@ func (w *Response) writeContinue() error {
 	if err := w.pushPipeline(); err != nil {
 		return err
 	}
+	w.acquireOutput()
 	if _, err := w.out.WriteString("HTTP/1.1 100 Continue\r\n\r\n"); err != nil {
 		return err
 	}
@@ -82,10 +94,30 @@ func (w *Response) FlushError() error {
 	if w.status == 0 {
 		w.WriteHeader(200)
 	}
-	w.record(w.buffer.Flush())
+	w.acquireOutput()
+	if w.buffer != nil {
+		err := w.buffer.Flush()
+		w.record(err)
+		if w.buffer.Buffered() == 0 {
+			w.bufferErr = err
+			w.releaseBuffer()
+		}
+	}
 	w.sendHead(nil)
-	w.record(w.out.Flush())
+	outErr := w.out.Flush()
+	w.record(outErr)
 	w.record(w.pushPipeline())
+	if owner, ok := w.transport.(responseOutputOwner); ok {
+		owner.ReleaseResponseOutput()
+		if outErr == nil {
+			w.out = nil
+		} else {
+			// bufio.Writer errors remain sticky even if a deadline is cleared.
+			w.out = bufio.NewWriterSize(failedResponseOutput{outErr}, 1)
+			_, err := w.out.Write([]byte{0, 0})
+			w.record(err)
+		}
+	}
 	return w.err
 }
 
@@ -133,6 +165,7 @@ func (w *Response) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	}
 	w.disableContinue(false)
 	if w.status != 0 {
+		w.acquireOutput()
 		// std flushes the chunk writer, not its 2048-byte handler buffer.
 		// Buffered body bytes are abandoned when ownership is hijacked.
 		w.sendHead(nil)

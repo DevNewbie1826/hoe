@@ -40,6 +40,7 @@ type Response struct {
 	trailers         []string
 	err              error
 	buffer           *bufio.Writer
+	bufferErr        error
 	chunks           responseChunks
 	continueMu       sync.Mutex
 	continuePending  bool
@@ -49,6 +50,13 @@ type Response struct {
 var responseBufferPool = sync.Pool{New: func() any {
 	return bufio.NewWriterSize(io.Discard, 2048)
 }}
+
+type responseOutputOwner interface {
+	AcquireResponseOutput() *bufio.Writer
+	GrowResponseOutput() *bufio.Writer
+	ReleaseResponseOutput()
+	SetResponseCleanup(func())
+}
 
 // NewResponse binds a request to blocking, bounded transport I/O. transport
 // may implement io.ReaderFrom, deadline methods, CloseNotify, and the Hijack
@@ -74,6 +82,9 @@ func NewResponse(r *http.Request, in *bufio.Reader, out *bufio.Writer, transport
 	w.chunks.w = w
 	w.buffer = responseBufferPool.Get().(*bufio.Writer)
 	w.buffer.Reset(&w.chunks)
+	if owner, ok := transport.(responseOutputOwner); ok {
+		owner.SetResponseCleanup(w.releaseBuffer)
+	}
 	if w.body != nil && hasToken(r.Header.Values("Expect"), "100-continue") && r.ProtoAtLeast(1, 1) {
 		w.expect, w.continuePending = true, true
 		w.body.beforeRead = w.writeContinue
@@ -108,6 +119,7 @@ func (w *Response) WriteHeader(code int) {
 	}
 	if code < 200 && code != 101 {
 		w.record(w.pushPipeline())
+		w.acquireOutput()
 		writeStatus(w.out, w.req.ProtoAtLeast(1, 1), code)
 		w.record(w.header.WriteSubset(w.out, map[string]bool{"Content-Length": true, "Transfer-Encoding": true}))
 		_, err := w.out.WriteString("\r\n")
@@ -135,7 +147,10 @@ func (w *Response) Write(p []byte) (int, error) {
 	if err := w.prepareWrite(len(p)); err != nil {
 		return 0, err
 	}
-	return w.buffer.Write(p)
+	if w.bufferErr != nil {
+		return 0, w.bufferErr
+	}
+	return w.acquireBuffer().Write(p)
 }
 
 // WriteString implements io.StringWriter with the same framing as Write.
@@ -143,7 +158,24 @@ func (w *Response) WriteString(s string) (int, error) {
 	if err := w.prepareWrite(len(s)); err != nil {
 		return 0, err
 	}
-	return w.buffer.WriteString(s)
+	if w.bufferErr != nil {
+		return 0, w.bufferErr
+	}
+	return w.acquireBuffer().WriteString(s)
+}
+
+func (w *Response) acquireBuffer() *bufio.Writer {
+	if w.buffer == nil {
+		w.buffer = responseBufferPool.Get().(*bufio.Writer)
+		w.buffer.Reset(&w.chunks)
+	}
+	return w.buffer
+}
+
+func (w *Response) acquireOutput() {
+	if w.out == nil {
+		w.out = w.transport.(responseOutputOwner).AcquireResponseOutput()
+	}
 }
 
 func (w *Response) prepareWrite(n int) error {
@@ -182,7 +214,10 @@ func (w *Response) Finish() error {
 	if w.status == 0 {
 		w.WriteHeader(200)
 	}
-	w.record(w.buffer.Flush())
+	w.acquireOutput()
+	if w.buffer != nil {
+		w.record(w.buffer.Flush())
+	}
 	if !w.wire {
 		w.sendHead(nil)
 	}

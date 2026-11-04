@@ -3,12 +3,101 @@ package http1
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 )
+
+type responseErrorWriter struct{ err error }
+
+func (w responseErrorWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func TestFlushErrorReleasesEmptyBuffer(t *testing.T) {
+	wantErr := errors.New("transport failure")
+	transport := responseErrorWriter{err: wantErr}
+	r, err := ParseHead([]byte(get("GET", "/", false)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := NewResponse(r, nil, bufio.NewWriter(transport), transport)
+	if _, err := w.Write([]byte("before")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.FlushError(); !errors.Is(err, wantErr) {
+		t.Fatalf("flush error=%v", err)
+	}
+	if w.buffer != nil {
+		t.Fatal("empty response buffer retained after failed output flush")
+	}
+	if n, err := w.Write([]byte("after")); n != 5 || err != nil {
+		t.Fatalf("buffered write after flush error=%d,%v", n, err)
+	}
+	if err := w.Finish(); !errors.Is(err, wantErr) {
+		t.Fatalf("finish error=%v", err)
+	}
+}
+
+func TestFlushReleasesEmptyBufferWithStickyError(t *testing.T) {
+	wantErr := errors.New("transport failure")
+	transport := responseErrorWriter{err: wantErr}
+	r, err := ParseHead([]byte(get("HEAD", "/", false)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := NewResponse(r, nil, bufio.NewWriter(transport), transport)
+	w.WriteHeader(http.StatusEarlyHints)
+	if _, err := w.Write([]byte("before")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.FlushError(); !errors.Is(err, wantErr) {
+		t.Fatalf("flush error=%v", err)
+	}
+	if w.buffer != nil {
+		t.Fatal("empty response buffer retained after sticky write error")
+	}
+	if n, err := w.Write([]byte("after")); n != 0 || !errors.Is(err, wantErr) {
+		t.Fatalf("write after sticky buffer error=%d,%v", n, err)
+	}
+	if err := w.Finish(); !errors.Is(err, wantErr) {
+		t.Fatalf("finish error=%v", err)
+	}
+}
+
+func TestFlushReleasesEmptyBuffer(t *testing.T) {
+	var output bytes.Buffer
+	r, err := ParseHead([]byte(get("GET", "/", false)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := NewResponse(r, nil, bufio.NewWriter(&output), &output)
+	if _, err := w.Write([]byte("before")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.FlushError(); err != nil {
+		t.Fatal(err)
+	}
+	if w.buffer != nil {
+		t.Fatal("empty response buffer retained after flush")
+	}
+	if _, err := w.Write([]byte("after")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(&output), r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || string(body) != "beforeafter" {
+		t.Fatalf("body=%q err=%v", body, err)
+	}
+}
 
 func TestDifferentialResponseRules(t *testing.T) {
 	cases := []struct {
