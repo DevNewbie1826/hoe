@@ -122,6 +122,21 @@ func main() {
 
 `Upgrader` also takes `CheckOrigin`, `Subprotocols` and `ReadLimit`, and `websocket.Upgrade(w, r, h)` uses the defaults. `Conn` has `WriteMessage`, `WriteControl`, `Close` and `SetReadLimit`. Hijack-based libraries such as gorilla/websocket work too.
 
+## Memory tuning
+
+These numbers come from a single run per setting on one machine (linux/arm64, Go 1.27.3), holding 10000 SSE streams with no errors. It's not a benchmark, and it's not a comparison with any other server.
+
+| Setting | Peak RSS (VmHWM) | first_p99 | Wall |
+| --- | --- | --- | --- |
+| `GOGC=400` | 298536 kB (291.5 MiB) | 1366 ms | 3488 ms |
+| `GOMEMLIMIT=250MiB` | 202888 kB (198.1 MiB) | 2283 ms | 4572 ms |
+
+Live heap after GC was 180.19 MB, and 158.21 MB of that was per-connection bufio buffers. The rest of the peak above the live heap is GC headroom.
+
+A memory limit below the peak forces collections during the connect ramp. So it buys a lower ceiling by spending first-byte tail latency. Raising `GOGC` alone didn't lower VmHWM in that run, and first_p99 stayed the same.
+
+Set `GOMEMLIMIT` when a memory ceiling matters, and accept a later first byte during a connect burst. Don't expect `GOGC` alone to lower the ceiling. hoe sets neither of them; both are standard Go runtime environment variables.
+
 ## Benchmark
 
 Conditions: the server ran on an Apple M1 Mac with `GOMAXPROCS=4`. Load came from wrk on a separate Mac (macmini) over Wi-Fi, with 1000 connections, 10 s per run and 3 rounds. Numbers are medians. The handler writes `Hello Benchmark`.
