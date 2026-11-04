@@ -64,15 +64,17 @@ func (b *requestIO) source(c *Conn) io.Reader {
 	return &demandReader{c: c}
 }
 
-// demandReader flags the connection the first time a read fills the small
-// reader buffer: only then has a request read beyond the small retention.
+// demandReader flags the connection the first time a read delivers the
+// small reader's full size: only then has a request read beyond the small
+// retention. Promoted full-size readers read through it too, so a body
+// moved off the small reader still marks demanding connections.
 type demandReader struct {
 	c *Conn
 }
 
 func (d *demandReader) Read(p []byte) (int, error) {
 	n, err := d.c.Read(p)
-	if n == len(p) && n > 0 {
+	if n >= smallReaderSize {
 		d.c.readerDemand.Store(true)
 	}
 	return n, err
@@ -170,6 +172,20 @@ func (c *Conn) stashBuffered(p []byte) {
 	c.readMu.Unlock()
 }
 
+// growRequestIO swaps the round's reader for a full-size one. Buffered
+// bytes move ahead of pending input so parsing results stay identical.
+func (c *Conn) growRequestIO(buffers *requestIO, source io.Reader) *requestIO {
+	grown := bigRequestIOPool.Get().(*requestIO)
+	if carry := buffers.in.Buffered(); carry > 0 {
+		p, _ := buffers.in.Peek(carry)
+		c.stashBuffered(p)
+	}
+	grown.in.Reset(source)
+	buffers.in.Reset(nil)
+	releaseRequestIO(buffers)
+	return grown
+}
+
 func (c *Conn) round() {
 	var buffers *requestIO
 	var in *bufio.Reader
@@ -243,23 +259,17 @@ func (c *Conn) round() {
 			in = buffers.in
 			in.Reset(buffers.source(c))
 		}
-		if !c.serveRequest(in, output, first) {
+		var served bool
+		buffers, served = c.serveRequest(buffers, output, first)
+		in = buffers.in
+		if !served {
 			return
 		}
 		if buffers.small && c.readerDemand.Load() {
 			// A read filled the small buffer: this connection needs the
-			// full-size reader. Buffered bytes move ahead of pending input
-			// so parsing results stay identical.
-			grown := bigRequestIOPool.Get().(*requestIO)
-			if carry := in.Buffered(); carry > 0 {
-				p, _ := in.Peek(carry)
-				c.stashBuffered(p)
-			}
-			grown.in.Reset(c)
-			in.Reset(nil)
-			releaseRequestIO(buffers)
-			buffers = grown
-			in = grown.in
+			// full-size reader.
+			buffers = c.growRequestIO(buffers, c)
+			in = buffers.in
 		}
 	}
 }
@@ -331,12 +341,13 @@ func (c *Conn) readHead() (bool, error) {
 	}
 }
 
-func (c *Conn) serveRequest(in *bufio.Reader, output *roundOutput, first bool) bool {
+func (c *Conn) serveRequest(buffers *requestIO, output *roundOutput, first bool) (*requestIO, bool) {
+	in := buffers.in
 	r, err := http1.ReadRequest(in, c.engine.server.MaxHeaderBytes)
 	if err != nil {
 		http1.WriteError(c, err)
 		c.Close()
-		return false
+		return buffers, false
 	}
 	// Only hold a round when another complete head is already buffered.
 	// Skip a known-length body; chunked bodies have no known next-head offset.
@@ -346,10 +357,21 @@ func (c *Conn) serveRequest(in *bufio.Reader, output *roundOutput, first bool) b
 		if completeHead(p[r.ContentLength:]) {
 			if err := c.beginPipeline(); err != nil {
 				c.Close()
-				return false
+				return buffers, false
 			}
 			output.acquireCork()
 		}
+	}
+	if buffers.small && len(r.TransferEncoding) > 0 {
+		// Chunked framing is bounded by the reader's capacity: chunk
+		// extension lines and trailers parse through ReadSlice and Peek on
+		// this reader, so the small reader would reject framing the
+		// pre-compaction full-size reader accepted. Promote before the
+		// first body byte is read; bodyless and fixed-length requests keep
+		// the small reader and its retention win.
+		buffers = c.growRequestIO(buffers, &demandReader{c})
+		in = buffers.in
+		http1.RebindBodyReader(r, in)
 	}
 	cancel := http1.BindContext(r, c.base)
 	r.RemoteAddr = c.remoteName
@@ -400,7 +422,7 @@ func (c *Conn) serveRequest(in *bufio.Reader, output *roundOutput, first bool) b
 	c.cancel = nil
 	c.mu.Unlock()
 	if w.Hijacked() {
-		return false
+		return buffers, false
 	}
 	err = w.Finish()
 	if err == nil {
@@ -408,7 +430,7 @@ func (c *Conn) serveRequest(in *bufio.Reader, output *roundOutput, first bool) b
 	}
 	if err != nil || w.CloseAfterReply() || !c.engine.keepAlive() {
 		c.Close()
-		return false
+		return buffers, false
 	}
 	if r.Method == "POST" {
 		c.postPadding = 4
@@ -428,7 +450,7 @@ func (c *Conn) serveRequest(in *bufio.Reader, output *roundOutput, first bool) b
 	}
 	c.startHead(true)
 	c.setState(http.StateIdle)
-	return true
+	return buffers, true
 }
 
 func (e *Engine) serverLog(format string, args ...any) {

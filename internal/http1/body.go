@@ -120,6 +120,23 @@ func OnBodyReadDone(r *http.Request, f func()) {
 	}
 }
 
+// RebindBodyReader re-points r's unread body framing at in. The connection
+// owner swaps its read buffer between head parse and the first body read;
+// the chunked decoder restarts over the new reader before any body byte or
+// trailer has been consumed.
+func RebindBodyReader(r *http.Request, in *bufio.Reader) {
+	b, ok := r.Body.(*Body)
+	if !ok {
+		return
+	}
+	b.mu.Lock()
+	b.in = in
+	if b.chunked {
+		b.source = httputil.NewChunkedReader(in)
+	}
+	b.mu.Unlock()
+}
+
 func (b *Body) readTrailer() error {
 	p, err := b.in.Peek(2)
 	if bytes.Equal(p, []byte("\r\n")) {
