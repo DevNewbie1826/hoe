@@ -3,8 +3,13 @@ package sched
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// idleTimersCreated counts idle-timer allocations; the allocation-shape
+// guard reads it to prove a worker blocked in a task holds no idle timer.
+var idleTimersCreated atomic.Int64
 
 type worker struct {
 	work     chan func()
@@ -22,6 +27,28 @@ type Pool struct {
 	closed bool
 	count  int
 	wg     sync.WaitGroup
+	// timers shares idle timers across this pool's workers. A timer must
+	// fire on the clock that armed it, so timers never cross pools.
+	timers sync.Pool // *time.Timer
+}
+
+func (p *Pool) acquireIdleTimer() *time.Timer {
+	if t, ok := p.timers.Get().(*time.Timer); ok {
+		t.Reset(p.expiry)
+		return t
+	}
+	idleTimersCreated.Add(1)
+	return time.NewTimer(p.expiry)
+}
+
+// releaseIdleTimer stops t, drains a fired-but-unread value, and shares t.
+func (p *Pool) releaseIdleTimer(t *time.Timer) {
+	t.Stop()
+	select {
+	case <-t.C:
+	default:
+	}
+	p.timers.Put(t)
 }
 
 // New creates a pool whose idle workers expire after idleTimeout.
@@ -77,8 +104,6 @@ func (p *Pool) run(w *worker, task func()) {
 		}
 		p.mu.Unlock()
 	}()
-	timer := time.NewTimer(p.expiry)
-	defer timer.Stop()
 	for {
 		task()
 		p.mu.Lock()
@@ -89,13 +114,15 @@ func (p *Pool) run(w *worker, task func()) {
 		w.idle = true
 		p.idle = append(p.idle, w)
 		p.mu.Unlock()
-		timer.Reset(p.expiry)
+		// The idle timer exists only between tasks: a worker blocked in a
+		// handler holds no timer, and idle waits share stopped timers.
+		timer := p.acquireIdleTimer()
 		select {
 		case next, ok := <-w.work:
+			p.releaseIdleTimer(timer)
 			if !ok {
 				return
 			}
-			timer.Stop()
 			task = next
 		case <-timer.C:
 			p.mu.Lock()
@@ -110,10 +137,12 @@ func (p *Pool) run(w *worker, task func()) {
 				}
 				w.idle = false
 				p.mu.Unlock()
+				p.releaseIdleTimer(timer)
 				return
 			}
 			// Submission or Close won the lock while the timer fired.
 			p.mu.Unlock()
+			p.releaseIdleTimer(timer)
 			next, ok := <-w.work
 			if !ok {
 				return

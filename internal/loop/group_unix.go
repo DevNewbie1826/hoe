@@ -5,6 +5,7 @@ package loop
 import (
 	"errors"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -18,7 +19,6 @@ type Group struct {
 	loops     []*reactor
 	handler   Handler
 	next      atomic.Uint64
-	tokens    atomic.Uint64
 	closed    atomic.Bool
 	closeOnce sync.Once
 	closeErr  error
@@ -65,7 +65,7 @@ func (g *Group) Listen(fd int) error {
 // Adopt takes ownership of an accepted nonblocking close-on-exec socket.
 // It closes the descriptor even if registration fails.
 func (g *Group) Adopt(fd int) error {
-	c := &Conn{loop: g.owner(), fd: fd, token: g.tokens.Add(1), done: make(chan struct{})}
+	c := &Conn{loop: g.owner(), fd: fd, done: make(chan struct{})}
 	cmd := &command{kind: adoptCommand, conn: c, reply: make(chan error, 1)}
 	if err := c.loop.enqueue(cmd); err != nil {
 		return errors.Join(err, syscall.Close(fd))
@@ -76,7 +76,7 @@ func (g *Group) Adopt(fd int) error {
 // AdoptAsync transfers ownership and reports registration completion without
 // making the caller wait for the destination reactor.
 func (g *Group) AdoptAsync(fd int, complete func(error)) error {
-	c := &Conn{loop: g.owner(), fd: fd, token: g.tokens.Add(1), done: make(chan struct{})}
+	c := &Conn{loop: g.owner(), fd: fd, done: make(chan struct{})}
 	if err := c.loop.enqueue(&command{kind: adoptCommand, conn: c, complete: complete}); err != nil {
 		return errors.Join(err, syscall.Close(fd))
 	}
@@ -107,7 +107,15 @@ func (g *Group) Close() error {
 
 type entry struct {
 	token uint64
-	conn  *Conn // nil identifies a listener
+	conn  *Conn
+}
+
+// listener records one listening descriptor. Listeners stay outside the
+// connection slots because their count is bounded by the caller, not by the
+// descriptor values the process happens to reach.
+type listener struct {
+	fd    int
+	token uint64
 }
 
 type commandKind uint8
@@ -141,17 +149,31 @@ type command struct {
 	complete    func(error)
 }
 
+// Connection registrations are addressed by a compact slot, never by
+// descriptor value: descriptors are process-global and spread across reactors,
+// so an fd-indexed table would hold one dense array per reactor sized by the
+// highest descriptor seen. The token carried by poll events encodes the slot in
+// its low bits and a registration sequence above it, so an event resolves in
+// O(1) and a stale token never matches a recycled slot.
+const (
+	slotBits = 24
+	slotMask = 1<<slotBits - 1
+)
+
 type reactor struct {
-	g        *Group
-	p        *poll.Poller
-	pool     *sched.Pool
-	table    []*entry
-	mu       sync.Mutex
-	commands []*command
-	stopped  bool
-	done     chan struct{}
-	err      error
-	tasks    []sched.Task
+	g         *Group
+	p         *poll.Poller
+	pool      *sched.Pool
+	slots     []*entry
+	free      []int
+	seq       uint64
+	listeners []listener
+	mu        sync.Mutex
+	commands  []*command
+	stopped   bool
+	done      chan struct{}
+	err       error
+	tasks     []sched.Task
 }
 
 func (l *reactor) enqueue(cmd *command) error {
@@ -179,19 +201,92 @@ func (l *reactor) call(cmd *command) error {
 	return <-cmd.reply
 }
 
-func (l *reactor) at(fd int) *entry {
-	if fd < 0 || fd >= len(l.table) {
+// mint returns the next registration token with low in its low bits.
+func (l *reactor) mint(low uint64) uint64 {
+	l.seq++
+	return l.seq<<slotBits | low
+}
+
+// register reserves a slot for e, mints its token, and publishes the entry.
+func (l *reactor) register(e *entry) uint64 {
+	slot := len(l.slots)
+	if n := len(l.free); n != 0 {
+		slot, l.free = l.free[n-1], l.free[:n-1]
+	} else {
+		l.slots = append(l.slots, nil)
+	}
+	e.token = l.mint(uint64(slot) << 1)
+	l.slots[slot] = e
+	return e.token
+}
+
+// registerConn registers a connection and republishes the token on it, so
+// interest and removal commands carry the identity the poller reports.
+func (l *reactor) registerConn(c *Conn) uint64 {
+	token := l.register(&entry{conn: c})
+	c.token = token
+	return token
+}
+
+// at resolves a poll token to its live registration.
+func (l *reactor) at(token uint64) *entry {
+	slot := int(token&slotMask) >> 1
+	if slot >= len(l.slots) {
 		return nil
 	}
-	return l.table[fd]
-}
-func (l *reactor) put(fd int, e *entry) {
-	if fd >= len(l.table) {
-		table := make([]*entry, max(fd+1, len(l.table)*2, 128))
-		copy(table, l.table)
-		l.table = table
+	if e := l.slots[slot]; e != nil && e.token == token {
+		return e
 	}
-	l.table[fd] = e
+	return nil
+}
+
+// freeSlot releases the registration addressed by token.
+func (l *reactor) freeSlot(token uint64) {
+	slot := int(token&slotMask) >> 1
+	if slot < len(l.slots) && l.slots[slot] != nil && l.slots[slot].token == token {
+		l.slots[slot] = nil
+		l.free = append(l.free, slot)
+	}
+}
+
+func (l *reactor) listenerAt(fd int, token uint64) bool {
+	for _, e := range l.listeners {
+		if e.fd == fd && e.token == token {
+			return true
+		}
+	}
+	return false
+}
+
+func (l *reactor) hasListener(fd int) bool {
+	for _, e := range l.listeners {
+		if e.fd == fd {
+			return true
+		}
+	}
+	return false
+}
+
+// registerListener registers fd for read readiness and records it.
+func (l *reactor) registerListener(fd int) error {
+	token := l.mint(0)
+	if err := l.p.Add(fd, token, true, false); err != nil {
+		return err
+	}
+	l.listeners = append(l.listeners, listener{fd: fd, token: token})
+	return nil
+}
+
+// closeListeners unregisters every listener in descriptor order.
+func (l *reactor) closeListeners() error {
+	ls := slices.Clone(l.listeners)
+	slices.SortFunc(ls, func(a, b listener) int { return a.fd - b.fd })
+	var err error
+	for _, e := range ls {
+		err = errors.Join(err, l.p.Delete(e.fd), syscall.Close(e.fd))
+	}
+	l.listeners = nil
+	return err
 }
 
 func (l *reactor) callback(c *Conn, fn func()) {
