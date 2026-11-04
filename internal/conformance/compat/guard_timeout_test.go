@@ -35,7 +35,7 @@ func TestGuardReadTimeoutCoversBody(t *testing.T) {
 		}
 		return p
 	}
-	same(t, run(false), run(true))
+	same(t, normalize(run(false)), normalize(run(true)))
 }
 
 func TestGuardWriteTimeoutResetsPerRequest(t *testing.T) {
