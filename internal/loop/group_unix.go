@@ -58,7 +58,8 @@ func New(cfg Config) (*Group, error) {
 	return g, nil
 }
 
-// placementPolicy selects the reactor that owns an adopted descriptor.
+// placementPolicy selects the reactor that owns an adopted descriptor and
+// each listener registered through Listen.
 type placementPolicy uint8
 
 const (

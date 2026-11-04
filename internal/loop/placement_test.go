@@ -5,11 +5,17 @@ package loop
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"slices"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
+
+	"github.com/DevNewbie1826/hoe/internal/poll"
 )
 
 // placementCases drives every guard on both policies the seam exposes.
@@ -154,7 +160,7 @@ func TestPlacementPoliciesAdoptExactlyOnce(t *testing.T) {
 }
 
 // TestPlacementPoliciesBalanceFailedAdoption guards the enqueue-failure
-// path: the caller gets the error, the descriptor is closed exactly once by
+// path: the caller gets the error, the descriptor is closed (EBADF) by
 // AdoptAsync, and the completion callback never fires.
 func TestPlacementPoliciesBalanceFailedAdoption(t *testing.T) {
 	for _, p := range placementCases {
@@ -182,6 +188,265 @@ func TestPlacementPoliciesBalanceFailedAdoption(t *testing.T) {
 			var st syscall.Stat_t
 			if err := syscall.Fstat(fd, &st); !errors.Is(err, syscall.EBADF) {
 				t.Fatalf("failed adoption left the descriptor open: fstat err=%v", err)
+			}
+		})
+	}
+}
+
+// sequencingHandler records each connection's callback sequence around the
+// echo behavior, so order guards can assert OnOpen strictly precedes the
+// first OnEvent on the connection's queue.
+type sequencingHandler struct {
+	echoHandler
+	mu  sync.Mutex
+	seq map[*Conn][]string
+}
+
+func (h *sequencingHandler) note(c *Conn, step string) {
+	h.mu.Lock()
+	h.seq[c] = append(h.seq[c], step)
+	h.mu.Unlock()
+}
+
+func (h *sequencingHandler) OnOpen(c *Conn) { h.note(c, "open"); h.echoHandler.OnOpen(c) }
+func (h *sequencingHandler) OnEvent(c *Conn, e poll.Event) {
+	h.note(c, "event")
+	h.echoHandler.OnEvent(c, e)
+}
+func (h *sequencingHandler) OnClose(c *Conn, err error) {
+	h.note(c, "close")
+	h.echoHandler.OnClose(c, err)
+}
+
+// TestPlacementPoliciesPipelineConnectionOrder guards the client-visible
+// ordering contract: a connection that writes its whole numbered pipeline in
+// one burst, immediately after dialing, must run OnOpen before its first
+// OnEvent and receive every byte back in FIFO order.
+func TestPlacementPoliciesPipelineConnectionOrder(t *testing.T) {
+	for _, p := range placementCases {
+		t.Run(p.name, func(t *testing.T) {
+			t.Setenv("HOE_LOOP_PLACEMENT", p.env)
+			h := &sequencingHandler{
+				echoHandler: echoHandler{open: make(chan *Conn, 64), closed: make(chan *Conn, 64)},
+				seq:         make(map[*Conn][]string),
+			}
+			_, addr := transport(t, h)
+			const conns = 8
+			want := make([]string, conns)
+			clients := make([]net.Conn, conns)
+			for i := range clients {
+				c := dial(t, addr)
+				clients[i] = c
+				var pipeline strings.Builder
+				for k := range 32 {
+					fmt.Fprintf(&pipeline, "policy=%s/conn=%02d/msg=%03d\n", p.name, i, k)
+				}
+				want[i] = pipeline.String()
+				// The burst is on the wire before this test observes any
+				// OnOpen, so adoption and the first readiness edge race.
+				if _, err := io.WriteString(c, want[i]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for range conns {
+				nextConn(t, h.open)
+			}
+			for i := range clients {
+				got := make([]byte, len(want[i]))
+				if _, err := io.ReadFull(clients[i], got); err != nil {
+					t.Fatal(err)
+				}
+				if string(got) != want[i] {
+					t.Fatalf("conn=%d echoed pipeline out of order: %q want %q", i, got, want[i])
+				}
+			}
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			if len(h.seq) != conns {
+				t.Fatalf("recorded %d connections, want %d", len(h.seq), conns)
+			}
+			for c, steps := range h.seq {
+				if steps[0] != "open" {
+					t.Fatalf("fd=%d callbacks %v: OnOpen must precede every OnEvent", c.fd, steps)
+				}
+				for _, step := range steps[1:] {
+					if step != "event" {
+						t.Fatalf("fd=%d callbacks %v: only readiness may follow OnOpen", c.fd, steps)
+					}
+				}
+			}
+		})
+	}
+}
+
+// gateHandler records callback sequences and parks the reactor inside
+// OnReadiness, which runs on the reactor goroutine before the round's
+// commands drain. Blocking it there lets a test enqueue a whole command
+// batch that a single drain pass must process in order.
+type gateHandler struct {
+	mu      sync.Mutex
+	seq     map[*Conn][]string
+	entered chan struct{}
+	release chan struct{}
+	gated   sync.Once
+	closes  chan *Conn
+}
+
+func (h *gateHandler) note(c *Conn, step string) {
+	h.mu.Lock()
+	h.seq[c] = append(h.seq[c], step)
+	h.mu.Unlock()
+}
+
+func (h *gateHandler) OnOpen(c *Conn)                { h.note(c, "open") }
+func (h *gateHandler) OnEvent(c *Conn, e poll.Event) { h.note(c, "event") }
+func (h *gateHandler) OnClose(c *Conn, err error) {
+	h.note(c, "close")
+	select {
+	case h.closes <- c:
+	default:
+	}
+}
+
+// OnReadiness holds the reactor until the test releases it, after its
+// queued commands are in place for one drain pass.
+func (h *gateHandler) OnReadiness(c *Conn, e poll.Event) {
+	h.gated.Do(func() { close(h.entered) })
+	<-h.release
+}
+
+// socketpair returns a connected descriptor pair shaped like an accepted
+// nonblocking close-on-exec socket plus its peer; the group owns the first
+// descriptor once adopted, the test owns the peer.
+func socketpair(t *testing.T) (int, int) {
+	t.Helper()
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fd := range fds {
+		syscall.CloseOnExec(fd)
+		if err := syscall.SetNonblock(fd, true); err != nil {
+			syscall.Close(fds[0])
+			syscall.Close(fds[1])
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { syscall.Close(fds[1]) })
+	return fds[0], fds[1]
+}
+
+// newGatedGroup starts a one-loop group and parks its reactor through one
+// gate connection whose readiness byte is already queued, returning once
+// OnReadiness holds the reactor. One loop guarantees every policy routes
+// the test's commands to the parked reactor.
+func newGatedGroup(t *testing.T, env string) (*Group, *gateHandler) {
+	t.Helper()
+	t.Setenv("HOE_LOOP_PLACEMENT", env)
+	h := &gateHandler{
+		seq:     make(map[*Conn][]string),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		closes:  make(chan *Conn, 32),
+	}
+	g, err := New(Config{Loops: 1, Handler: h})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { g.Close() })
+	gateFd, gatePeer := socketpair(t)
+	if _, err := syscall.Write(gatePeer, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.AdoptAsync(gateFd, func(error) {}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-h.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("gate readiness never reached the reactor")
+	}
+	return g, h
+}
+
+// TestPlacementPoliciesDrainCommandFIFO guards the drain order: with the
+// reactor parked mid-round, a back-to-back AdoptAsync burst shares one
+// drain pass, and the completion callbacks (which run on the reactor, in
+// drain order) must fire in submission order.
+func TestPlacementPoliciesDrainCommandFIFO(t *testing.T) {
+	for _, p := range placementCases {
+		t.Run(p.name, func(t *testing.T) {
+			g, h := newGatedGroup(t, p.env)
+			const burst = 16
+			completions := make(chan int, burst)
+			for i := range burst {
+				fd, _ := socketpair(t)
+				if err := g.AdoptAsync(fd, func(error) { completions <- i }); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Every command above queued behind the parked reactor; releasing
+			// it runs one drain pass over the whole batch.
+			close(h.release)
+			for i := range burst {
+				select {
+				case got := <-completions:
+					if got != i {
+						t.Fatalf("drain completed adoption %d at position %d: commands must complete in submission order", got, i)
+					}
+				case <-time.After(10 * time.Second):
+					t.Fatalf("adoption %d never completed", i)
+				}
+			}
+			if err := g.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// TestPlacementPoliciesAdoptBeforeShutdownOrder guards a connection adopted
+// in the same drain batch that stops the reactor: registration must succeed,
+// and OnOpen must precede OnClose on that connection's queue even though
+// shutdown removes the descriptor in the same round.
+func TestPlacementPoliciesAdoptBeforeShutdownOrder(t *testing.T) {
+	for _, p := range placementCases {
+		t.Run(p.name, func(t *testing.T) {
+			g, h := newGatedGroup(t, p.env)
+			fd, _ := socketpair(t)
+			completed := make(chan error, 1)
+			if err := g.AdoptAsync(fd, func(err error) { completed <- err }); err != nil {
+				t.Fatal(err)
+			}
+			// Adoption and stop share the parked reactor's next drain pass.
+			if err := g.loops[0].enqueue(&command{kind: stopCommand}); err != nil {
+				t.Fatal(err)
+			}
+			close(h.release)
+			select {
+			case err := <-completed:
+				if err != nil {
+					t.Fatalf("adoption racing shutdown completed with %v", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("adoption never completed")
+			}
+			for range 2 { // the gate connection and the adopted connection
+				select {
+				case <-h.closes:
+				case <-time.After(10 * time.Second):
+					t.Fatal("shutdown never closed the adopted connection")
+				}
+			}
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			for c, steps := range h.seq {
+				if steps[0] != "open" || steps[len(steps)-1] != "close" {
+					t.Fatalf("fd=%d callbacks %v: OnOpen must precede OnClose on the connection queue", c.fd, steps)
+				}
+			}
+			if err := g.Close(); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}
