@@ -64,7 +64,7 @@ func TestPlacementPoliciesServeExactlyOnceInOrder(t *testing.T) {
 					fmt.Fprint(w, r.URL.Path)
 				}),
 			}
-			engine, err := New(srv, ln, Policy{KeepAlive: func() bool { return true }})
+			engine, err := New(srv, Policy{KeepAlive: func() bool { return true }})
 			if err != nil {
 				ln.Close()
 				t.Fatal(err)
@@ -131,10 +131,10 @@ func TestPlacementPoliciesServeExactlyOnceInOrder(t *testing.T) {
 				t.Fatal("Serve did not return after Shutdown")
 			}
 			engine.mu.Lock()
-			opening, live, adoptErr := engine.opening, len(engine.conns), engine.adoptErr
+			opening, live := engine.opening, len(engine.conns)
 			engine.mu.Unlock()
-			if opening != 0 || live != 0 || adoptErr != nil {
-				t.Fatalf("adoption accounting: opening=%d live=%d adoptErr=%v", opening, live, adoptErr)
+			if opening != 0 || live != 0 {
+				t.Fatalf("adoption accounting: opening=%d live=%d", opening, live)
 			}
 			if got := len(rec.opens); got != conns {
 				t.Fatalf("ConnContext saw %d connections, want %d", got, conns)
@@ -182,7 +182,7 @@ func TestPlacementPoliciesBalanceAdoptionFailure(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			engine, err := New(&http.Server{}, ln, Policy{})
+			engine, err := New(&http.Server{}, Policy{})
 			if err != nil {
 				ln.Close()
 				t.Fatal(err)
@@ -193,9 +193,11 @@ func TestPlacementPoliciesBalanceAdoptionFailure(t *testing.T) {
 			})
 			serveDone := make(chan error, 1)
 			go func() { serveDone <- engine.Serve(ln) }()
+			awaitRegistered(t, engine, ln)
 			// The invalid descriptor fails poller registration on the
-			// policy-selected reactor without creating a connection.
-			if err := engine.adopt(-1); err != nil {
+			// policy-selected reactor without creating a connection, and the
+			// failure surfaces from this listener's Serve.
+			if err := engine.adopt(-1, ln); err != nil {
 				t.Fatalf("enqueue adoption: %v", err)
 			}
 			select {
@@ -207,13 +209,10 @@ func TestPlacementPoliciesBalanceAdoptionFailure(t *testing.T) {
 				t.Fatal("Serve did not report the adoption failure")
 			}
 			engine.mu.Lock()
-			opening, adoptErr := engine.opening, engine.adoptErr
+			opening := engine.opening
 			engine.mu.Unlock()
 			if opening != 0 {
 				t.Fatalf("opening=%d after adoption failure, want 0", opening)
-			}
-			if adoptErr == nil || !errors.Is(adoptErr, syscall.EBADF) {
-				t.Fatalf("adoptErr=%v want %v", adoptErr, syscall.EBADF)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()

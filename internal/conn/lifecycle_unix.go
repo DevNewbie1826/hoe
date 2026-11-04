@@ -24,23 +24,27 @@ func (e *Engine) watchLocked() <-chan struct{} {
 	return e.changed
 }
 
-// StopListening stops acceptance without interrupting active responses.
+// StopListening stops all acceptance without interrupting active responses.
+// Listeners already registered are closed; each Serve loop then publishes the
+// engine-wide stop as its listener ends.
 func (e *Engine) StopListening() error {
 	e.stopping.Store(true)
-	return e.stopAcceptance()
-}
-
-// stopAcceptance also handles caller listener closure without requesting
-// shutdown of sockets which have already been accepted.
-func (e *Engine) stopAcceptance() error {
-	var err error
-	e.stopOnce.Do(func() {
-		err = e.listener.Close()
-		if errors.Is(err, net.ErrClosed) {
-			err = nil
-		}
-		close(e.stopped)
-	})
+	e.mu.Lock()
+	ls := make([]*net.TCPListener, 0, len(e.listeners))
+	for l := range e.listeners {
+		ls = append(ls, l)
+	}
+	last := len(ls) == 0
+	e.mu.Unlock()
+	for _, l := range ls {
+		e.noteListenerClose(l.Close())
+	}
+	if last {
+		e.stopOnce.Do(func() { close(e.stopped) })
+	}
+	e.mu.Lock()
+	err := e.acceptErr
+	e.mu.Unlock()
 	return err
 }
 

@@ -5,7 +5,6 @@ package conn
 
 import (
 	"context"
-	"errors"
 	"net"
 	"net/http"
 	"sync"
@@ -17,18 +16,19 @@ import (
 	"github.com/DevNewbie1826/hoe/internal/poll"
 )
 
-// Engine owns one listener's HTTP connections, workers, and deadline wheel.
+// Engine owns the HTTP connections, workers, and deadline wheel for every
+// listener served through it. Concurrent Serve calls on different listeners
+// share one loop group, one worker pool per reactor, and one wheel.
 type Engine struct {
 	server          *http.Server
 	keepAlive       func() bool
 	pipelineDelay   time.Duration
-	base            context.Context
 	group           *loop.Group
-	listener        *net.TCPListener
+	listeners       map[*net.TCPListener]*listenerState // guarded by mu
 	mu              sync.Mutex
 	conns           map[*loop.Conn]*Conn
 	opening         int   // guarded by mu; adopted sockets awaiting OnOpen completion
-	adoptErr        error // guarded by mu
+	acceptErr       error // guarded by mu; listener close errors observed while stopping
 	adoptions       sync.WaitGroup
 	changed         chan struct{}
 	stopping        atomic.Bool
@@ -42,130 +42,28 @@ type Engine struct {
 	timers          deadlineWheel
 }
 
-// New prepares a TCP engine using the standard server configuration snapshot.
-// The supplied keepAlive predicate includes shutdown and runtime policy.
-func New(s *http.Server, l *net.TCPListener, policy Policy) (*Engine, error) {
-	base := context.Background()
-	if s.BaseContext != nil {
-		base = s.BaseContext(l)
-		if base == nil {
-			panic("BaseContext returned a nil context")
-		}
-	}
+// New prepares a TCP engine using the standard server configuration
+// snapshot. The supplied keepAlive predicate includes shutdown and runtime
+// policy. Policy.Loops selects the reactor count; zero uses
+// loop.DefaultLoops. BaseContext is applied once per listener in Serve.
+func New(s *http.Server, policy Policy) (*Engine, error) {
 	delay := policy.PipelineFlushDelay
 	if delay == 0 {
 		delay = time.Millisecond
 	}
-	e := &Engine{server: s, keepAlive: policy.KeepAlive, pipelineDelay: delay, base: context.WithValue(base, http.ServerContextKey, s),
-		conns: make(map[*loop.Conn]*Conn), changed: make(chan struct{}), stopped: make(chan struct{}), finalized: make(chan struct{}), resourcesClosed: make(chan struct{})}
+	e := &Engine{server: s, keepAlive: policy.KeepAlive, pipelineDelay: delay,
+		listeners: make(map[*net.TCPListener]*listenerState),
+		conns:     make(map[*loop.Conn]*Conn), changed: make(chan struct{}), stopped: make(chan struct{}), finalized: make(chan struct{}), resourcesClosed: make(chan struct{})}
 	e.timers.init()
-	g, err := loop.New(loop.Config{Handler: e, IdleWorkerTimeout: time.Second})
+	g, err := loop.New(loop.Config{Handler: e, IdleWorkerTimeout: time.Second, Loops: policy.Loops})
 	if err != nil {
 		return nil, err
 	}
 	e.group = g
-	e.listener = l
 	go e.timers.run()
 	trackEngine(e, true)
 	go e.finalize()
 	return e, nil
-}
-
-// Serve accepts on the caller's listener and transfers sockets to the loops.
-// It returns when acceptance stops, independently of active request completion.
-func (e *Engine) Serve(l *net.TCPListener) (serveErr error) {
-	defer e.stopAcceptance()
-	defer func() {
-		e.adoptions.Wait()
-		e.mu.Lock()
-		err := e.adoptErr
-		e.mu.Unlock()
-		if err != nil {
-			if e.stopping.Load() {
-				serveErr = http.ErrServerClosed
-			} else {
-				serveErr = err
-			}
-		}
-	}()
-	var tempDelay time.Duration
-	for {
-		c, err := l.AcceptTCP()
-		if err != nil {
-			if e.stopping.Load() {
-				return http.ErrServerClosed
-			}
-			var temporary net.Error
-			if errors.As(err, &temporary) && temporary.Temporary() {
-				if tempDelay == 0 {
-					tempDelay = 5 * time.Millisecond
-				} else {
-					tempDelay = min(tempDelay*2, time.Second)
-				}
-				if logger := e.server.ErrorLog; logger != nil {
-					logger.Printf("http: Accept error: %v; retrying in %v", err, tempDelay)
-				} else {
-					e.serverLog("http: Accept error: %v; retrying in %v", err, tempDelay)
-				}
-				time.Sleep(tempDelay)
-				continue
-			}
-			return err
-		}
-		tempDelay = 0
-		raw, err := c.SyscallConn()
-		if err != nil {
-			c.Close()
-			return err
-		}
-		fd := -1
-		var dupErr error
-		err = raw.Control(func(socket uintptr) {
-			// Dup preserves the accepted socket's nonblocking flag. Unlike
-			// TCPConn.File, it never changes the runtime-owned file status.
-			syscall.ForkLock.RLock()
-			defer syscall.ForkLock.RUnlock()
-			fd, dupErr = syscall.Dup(int(socket))
-			if dupErr == nil {
-				syscall.CloseOnExec(fd)
-			}
-		})
-		closeErr := c.Close()
-		if err = errors.Join(err, dupErr, closeErr); err != nil {
-			if fd >= 0 {
-				syscall.Close(fd)
-			}
-			return err
-		}
-		if err = e.adopt(fd); err != nil {
-			return err
-		}
-	}
-}
-
-func (e *Engine) adopt(fd int) error {
-	e.mu.Lock()
-	e.opening++
-	e.mu.Unlock()
-	e.adoptions.Add(1)
-	if err := e.group.AdoptAsync(fd, e.adopted); err != nil {
-		e.adopted(err)
-		return err
-	}
-	return nil
-}
-
-func (e *Engine) adopted(err error) {
-	if err != nil {
-		e.mu.Lock()
-		if e.adoptErr == nil {
-			e.adoptErr = err
-		}
-		e.mu.Unlock()
-		e.finishOpen()
-		e.listener.Close()
-	}
-	e.adoptions.Done()
 }
 
 // OnOpen creates the stable net.Conn identity and context chain.
@@ -183,7 +81,10 @@ func (e *Engine) OnOpen(raw *loop.Conn) {
 	}
 	c := &Conn{engine: e, raw: raw, local: tcpAddr(local), remote: tcpAddr(remote), changed: make(chan struct{}), timerSlot: -1}
 	c.accepted = time.Now()
-	c.base = e.base
+	c.base, _ = raw.Tag.(context.Context)
+	if c.base == nil {
+		c.base = context.Background()
+	}
 	if e.server.ConnContext != nil {
 		c.base = e.server.ConnContext(c.base, c)
 		if c.base == nil {

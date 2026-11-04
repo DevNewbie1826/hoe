@@ -17,7 +17,10 @@ import (
 // buffer while idle. Its I/O lock prevents close or detach during a syscall.
 type Conn struct {
 	// Data publishes the handler's lifetime attachment, once, during OnOpen.
-	Data                  atomic.Value
+	Data atomic.Value
+	// Tag carries the adopter's payload from AdoptAsync to OnOpen. It is
+	// set once at construction and never mutated afterwards.
+	Tag                   any
 	loop                  *reactor
 	fd                    int
 	token                 uint64

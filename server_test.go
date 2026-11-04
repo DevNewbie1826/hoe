@@ -1,16 +1,21 @@
 package hoe
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"runtime"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/DevNewbie1826/hoe/internal/conn"
+	"github.com/DevNewbie1826/hoe/internal/loop"
 )
 
 func TestConfigurationAfterLifecycleSetup(t *testing.T) {
@@ -105,4 +110,288 @@ func TestEngineInUse(t *testing.T) {
 	if s.engineKind() == "std" {
 		t.Fatal("plaintext TCP still delegates to net/http; N3 engine required")
 	}
+}
+
+// goroutineFrames counts frames matching substr across every goroutine's
+// stack; it is the census primitive for the shared-engine proofs.
+func goroutineFrames(substr string) int {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			return strings.Count(string(buf[:n]), substr)
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+}
+
+// waitUntil polls cond under a deadline. Goroutine start and exit expose no
+// event to subscribe to, so a bounded condition poll is the deterministic
+// wait for census counts.
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func listenTCP(t *testing.T) *net.TCPListener {
+	t.Helper()
+	l, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return l
+}
+
+// postEcho POSTs body to addr through tr and returns the response body.
+func postEcho(t *testing.T, tr *http.Transport, addr, body string) string {
+	t.Helper()
+	client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
+	resp, err := client.Post("http://"+addr, "text/plain", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST http://%s status=%d", addr, resp.StatusCode)
+	}
+	p, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(p)
+}
+
+// writeAll sends one raw HTTP request head.
+func writeAll(t *testing.T, c net.Conn, req string) {
+	t.Helper()
+	if _, err := io.WriteString(c, req); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// readResponseBody reads exactly one response body from a raw connection.
+func readResponseBody(t *testing.T, c net.Conn) string {
+	t.Helper()
+	r, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Body.Close()
+	p, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(p)
+}
+
+func TestServeAll(t *testing.T) {
+	if !conn.Supported() {
+		t.Skip("documented standard-library fallback platform")
+	}
+	// Given GOMAXPROCS pinned to DefaultLoops, so ServeAll's GOMAXPROCS-sized
+	// shared group and Serve's DefaultLoops group hold the same census.
+	prev := runtime.GOMAXPROCS(loop.DefaultLoops())
+	t.Cleanup(func() { runtime.GOMAXPROCS(prev) })
+	const payload = "serveall echo"
+	echo := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+			return
+		}
+		w.Write(p)
+	})
+	tr := &http.Transport{}
+	defer tr.CloseIdleConnections()
+
+	// Given a one-listener Serve engine as the census comparison shape.
+	one := listenTCP(t)
+	s1 := &Server{Handler: echo}
+	d1 := make(chan error, 1)
+	go func() { d1 <- s1.Serve(one) }()
+	if got := postEcho(t, tr, one.Addr().String(), payload); got != payload {
+		t.Fatalf("one-listener body=%q want %q", got, payload)
+	}
+	waitUntil(t, "one-listener reactor census", func() bool {
+		return goroutineFrames("internal/loop.(*reactor).run(") == loop.DefaultLoops()
+	})
+	single := goroutineFrames("internal/loop.(*reactor).run(")
+	if err := s1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-d1; !errors.Is(err, ErrServerClosed) {
+		t.Fatalf("Serve after Close: %v", err)
+	}
+	waitUntil(t, "one-listener engine release", func() bool {
+		return conn.SnapshotResources().Engines == 0
+	})
+
+	// When three listeners share one ServeAll engine.
+	ls := make([]net.Listener, 3)
+	addrs := make([]string, len(ls))
+	for i := range ls {
+		ls[i] = listenTCP(t)
+		addrs[i] = ls[i].Addr().String()
+	}
+	s := &Server{Handler: echo}
+	d := make(chan error, 1)
+	go func() { d <- s.ServeAll(ls...) }()
+	for i, addr := range addrs {
+		if got := postEcho(t, tr, addr, payload); got != payload {
+			t.Fatalf("listener %d body=%q want %q", i, got, payload)
+		}
+	}
+
+	// Then one engine serves every listener, with the one-listener reactor
+	// census, one deadline wheel, and one finalizer.
+	if engines := conn.SnapshotResources().Engines; engines != 1 {
+		t.Fatalf("engines=%d want 1", engines)
+	}
+	waitUntil(t, "ServeAll reactor census", func() bool {
+		return goroutineFrames("internal/loop.(*reactor).run(") == single
+	})
+	if wheels := goroutineFrames("internal/conn.(*deadlineWheel).run("); wheels != 1 {
+		t.Fatalf("deadline wheels=%d want 1", wheels)
+	}
+	if finalizers := goroutineFrames("internal/conn.(*Engine).finalize("); finalizers != 1 {
+		t.Fatalf("engine finalizers=%d want 1", finalizers)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-d; !errors.Is(err, ErrServerClosed) {
+		t.Fatalf("ServeAll after Close: %v", err)
+	}
+}
+
+func TestServeAllShutdown(t *testing.T) {
+	if !conn.Supported() {
+		t.Skip("documented standard-library fallback platform")
+	}
+	// Given two listeners served through one shared engine, one connection
+	// held active inside its handler and one parked idle after a request.
+	ls := []net.Listener{listenTCP(t), listenTCP(t)}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	s := &Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/hold" {
+			once.Do(func() { close(entered) })
+			<-release
+		}
+		fmt.Fprint(w, r.URL.Path)
+	})}
+	d := make(chan error, 1)
+	go func() { d <- s.ServeAll(ls...) }()
+
+	idle, err := net.Dial("tcp", ls[0].Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idle.Close()
+	writeAll(t, idle, "GET /idle HTTP/1.1\r\nHost: t\r\n\r\n")
+	if got := readResponseBody(t, idle); got != "/idle" {
+		t.Fatalf("idle warmup body=%q", got)
+	}
+	active, err := net.Dial("tcp", ls[1].Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer active.Close()
+	writeAll(t, active, "GET /hold HTTP/1.1\r\nHost: t\r\n\r\n")
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("held request never reached its handler")
+	}
+
+	// When Shutdown runs while one request is active on another listener.
+	shutdownErr := make(chan error, 1)
+	go func() { shutdownErr <- s.Shutdown(context.Background()) }()
+
+	// Then the idle connection closes while the held request stays live,
+	// finishes, and only then does ServeAll return ErrServerClosed.
+	if err := idle.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idle.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("idle connection read after Shutdown: %v, want EOF", err)
+	}
+	close(release)
+	if got := readResponseBody(t, active); got != "/hold" {
+		t.Fatalf("held request body=%q", got)
+	}
+	if err := <-shutdownErr; err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if err := <-d; !errors.Is(err, ErrServerClosed) {
+		t.Fatalf("ServeAll after Shutdown: %v", err)
+	}
+	waitUntil(t, "engine release", func() bool { return conn.SnapshotResources().Engines == 0 })
+}
+
+func TestServeAllClose(t *testing.T) {
+	if !conn.Supported() {
+		t.Skip("documented standard-library fallback platform")
+	}
+	// Given three listeners sharing one engine, each with a keep-alive
+	// connection parked idle after one request.
+	ls := make([]net.Listener, 3)
+	for i := range ls {
+		ls[i] = listenTCP(t)
+	}
+	s := &Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	})}
+	before := runtime.NumGoroutine()
+	d := make(chan error, 1)
+	go func() { d <- s.ServeAll(ls...) }()
+	var idle []net.Conn
+	defer func() {
+		for _, c := range idle {
+			c.Close()
+		}
+	}()
+	for _, l := range ls {
+		c, err := net.Dial("tcp", l.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		idle = append(idle, c)
+		writeAll(t, c, "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+		if got := readResponseBody(t, c); got != "ok" {
+			t.Fatalf("warmup body=%q", got)
+		}
+	}
+	waitUntil(t, "shared engine census", func() bool { return conn.SnapshotResources().Engines == 1 })
+
+	// When Close runs with every connection idle.
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-d; !errors.Is(err, ErrServerClosed) {
+		t.Fatalf("ServeAll after Close: %v, want ErrServerClosed", err)
+	}
+
+	// Then every listener is freed, no engine goroutine remains behind
+	// (reactor, wheel, finalizer, worker), and the goroutine count returns
+	// to its pre-serve baseline.
+	for _, l := range ls {
+		if c, err := net.DialTimeout("tcp", l.Addr().String(), time.Second); err == nil {
+			c.Close()
+			t.Fatalf("listener %s still accepts after Close", l.Addr())
+		}
+	}
+	waitUntil(t, "reactor release", func() bool { return goroutineFrames("internal/loop.(*reactor).run(") == 0 })
+	waitUntil(t, "deadline wheel release", func() bool { return goroutineFrames("internal/conn.(*deadlineWheel).run(") == 0 })
+	waitUntil(t, "finalizer release", func() bool { return goroutineFrames("internal/conn.(*Engine).finalize(") == 0 })
+	waitUntil(t, "worker release", func() bool { return goroutineFrames("internal/sched.(*Pool).run(") == 0 })
+	waitUntil(t, "engine registry release", func() bool { return conn.SnapshotResources().Engines == 0 })
+	waitUntil(t, "goroutine baseline", func() bool { return runtime.NumGoroutine() <= before })
 }

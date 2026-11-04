@@ -36,7 +36,7 @@ func TestFirstRequestChunkedFramingOnFreshConnection(t *testing.T) {
 		}
 		w.Write(body)
 	})}
-	engine, err := New(srv, ln, Policy{KeepAlive: func() bool { return true }})
+	engine, err := New(srv, Policy{KeepAlive: func() bool { return true }})
 	if err != nil {
 		ln.Close()
 		t.Fatal(err)
