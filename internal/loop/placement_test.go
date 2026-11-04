@@ -289,6 +289,7 @@ type gateHandler struct {
 	entered chan struct{}
 	release chan struct{}
 	gated   sync.Once
+	unpark  sync.Once
 	closes  chan *Conn
 }
 
@@ -340,6 +341,10 @@ func socketpair(t *testing.T) (int, int) {
 // gate connection whose readiness byte is already queued, returning once
 // OnReadiness holds the reactor. One loop guarantees every policy routes
 // the test's commands to the parked reactor.
+// releaseGate unparks the reactor exactly once, so a test that fails while
+// the reactor is parked still lets Group.Close return instead of hanging.
+func (h *gateHandler) releaseGate() { h.unpark.Do(func() { close(h.release) }) }
+
 func newGatedGroup(t *testing.T, env string) (*Group, *gateHandler) {
 	t.Helper()
 	t.Setenv("HOE_LOOP_PLACEMENT", env)
@@ -354,6 +359,8 @@ func newGatedGroup(t *testing.T, env string) (*Group, *gateHandler) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { g.Close() })
+	// Registered after Close's cleanup, so it runs first (LIFO) on every exit path.
+	t.Cleanup(h.releaseGate)
 	gateFd, gatePeer := socketpair(t)
 	if _, err := syscall.Write(gatePeer, []byte("x")); err != nil {
 		t.Fatal(err)
@@ -387,7 +394,7 @@ func TestPlacementPoliciesDrainCommandFIFO(t *testing.T) {
 			}
 			// Every command above queued behind the parked reactor; releasing
 			// it runs one drain pass over the whole batch.
-			close(h.release)
+			h.releaseGate()
 			for i := range burst {
 				select {
 				case got := <-completions:
@@ -422,7 +429,7 @@ func TestPlacementPoliciesAdoptBeforeShutdownOrder(t *testing.T) {
 			if err := g.loops[0].enqueue(&command{kind: stopCommand}); err != nil {
 				t.Fatal(err)
 			}
-			close(h.release)
+			h.releaseGate()
 			select {
 			case err := <-completed:
 				if err != nil {
