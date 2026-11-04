@@ -192,7 +192,7 @@ func (c *Conn) round() {
 	output := &roundOutput{Conn: c}
 	defer func() {
 		if buffers != nil {
-			in.Reset(nil)
+			buffers.in.Reset(nil)
 			output.ReleaseResponseOutput()
 			releaseRequestIO(buffers)
 		}
@@ -259,8 +259,7 @@ func (c *Conn) round() {
 			in = buffers.in
 			in.Reset(buffers.source(c))
 		}
-		var served bool
-		buffers, served = c.serveRequest(buffers, output, first)
+		served := c.serveRequest(&buffers, output, first)
 		in = buffers.in
 		if !served {
 			return
@@ -341,13 +340,15 @@ func (c *Conn) readHead() (bool, error) {
 	}
 }
 
-func (c *Conn) serveRequest(buffers *requestIO, output *roundOutput, first bool) (*requestIO, bool) {
-	in := buffers.in
+// serveRequest publishes a promoted reader through bp before the handler
+// runs, so a panic unwinds with round() owning exactly the live reader.
+func (c *Conn) serveRequest(bp **requestIO, output *roundOutput, first bool) bool {
+	in := (*bp).in
 	r, err := http1.ReadRequest(in, c.engine.server.MaxHeaderBytes)
 	if err != nil {
 		http1.WriteError(c, err)
 		c.Close()
-		return buffers, false
+		return false
 	}
 	// Only hold a round when another complete head is already buffered.
 	// Skip a known-length body; chunked bodies have no known next-head offset.
@@ -357,20 +358,20 @@ func (c *Conn) serveRequest(buffers *requestIO, output *roundOutput, first bool)
 		if completeHead(p[r.ContentLength:]) {
 			if err := c.beginPipeline(); err != nil {
 				c.Close()
-				return buffers, false
+				return false
 			}
 			output.acquireCork()
 		}
 	}
-	if buffers.small && len(r.TransferEncoding) > 0 {
+	if (*bp).small && len(r.TransferEncoding) > 0 {
 		// Chunked framing is bounded by the reader's capacity: chunk
 		// extension lines and trailers parse through ReadSlice and Peek on
 		// this reader, so the small reader would reject framing the
 		// pre-compaction full-size reader accepted. Promote before the
 		// first body byte is read; bodyless and fixed-length requests keep
 		// the small reader and its retention win.
-		buffers = c.growRequestIO(buffers, &demandReader{c})
-		in = buffers.in
+		*bp = c.growRequestIO(*bp, &demandReader{c})
+		in = (*bp).in
 		http1.RebindBodyReader(r, in)
 	}
 	cancel := http1.BindContext(r, c.base)
@@ -422,7 +423,7 @@ func (c *Conn) serveRequest(buffers *requestIO, output *roundOutput, first bool)
 	c.cancel = nil
 	c.mu.Unlock()
 	if w.Hijacked() {
-		return buffers, false
+		return false
 	}
 	err = w.Finish()
 	if err == nil {
@@ -430,7 +431,7 @@ func (c *Conn) serveRequest(buffers *requestIO, output *roundOutput, first bool)
 	}
 	if err != nil || w.CloseAfterReply() || !c.engine.keepAlive() {
 		c.Close()
-		return buffers, false
+		return false
 	}
 	if r.Method == "POST" {
 		c.postPadding = 4
@@ -450,7 +451,7 @@ func (c *Conn) serveRequest(buffers *requestIO, output *roundOutput, first bool)
 	}
 	c.startHead(true)
 	c.setState(http.StateIdle)
-	return buffers, true
+	return true
 }
 
 func (e *Engine) serverLog(format string, args ...any) {
