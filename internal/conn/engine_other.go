@@ -25,6 +25,9 @@ func New(*http.Server, Policy) (*Engine, error) {
 // Serve reports an unsupported event engine platform.
 func (*Engine) Serve(*net.TCPListener) error { return poll.ErrUnsupported }
 
+// ServeAll reports an unsupported event engine platform.
+func (*Engine) ServeAll(...*net.TCPListener) error { return poll.ErrUnsupported }
+
 // Shutdown has no engine resources on this platform.
 func (*Engine) Shutdown(context.Context) error { return nil }
 
