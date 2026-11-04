@@ -117,9 +117,10 @@ func (g *Group) Adopt(fd int) error {
 }
 
 // AdoptAsync transfers ownership and reports registration completion without
-// making the caller wait for the destination reactor.
-func (g *Group) AdoptAsync(fd int, complete func(error)) error {
-	c := &Conn{loop: g.owner(fd), fd: fd, done: make(chan struct{})}
+// making the caller wait for the destination reactor. tag rides on the
+// connection to Handler.OnOpen unchanged; adopters with no payload pass nil.
+func (g *Group) AdoptAsync(fd int, tag any, complete func(error)) error {
+	c := &Conn{loop: g.owner(fd), fd: fd, done: make(chan struct{}), Tag: tag}
 	if err := c.loop.enqueue(&command{kind: adoptCommand, conn: c, complete: complete}); err != nil {
 		return errors.Join(err, syscall.Close(fd))
 	}

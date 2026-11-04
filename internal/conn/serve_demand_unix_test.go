@@ -38,7 +38,7 @@ func TestReaderDemandPolicyOnRealReads(t *testing.T) {
 			seen.Do(func() { conns <- nc.(*Conn) })
 		},
 	}
-	engine, err := New(srv, listener, Policy{KeepAlive: func() bool { return true }})
+	engine, err := New(srv, Policy{KeepAlive: func() bool { return true }})
 	if err != nil {
 		listener.Close()
 		t.Fatal(err)

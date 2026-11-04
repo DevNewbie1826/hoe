@@ -108,7 +108,7 @@ func parkedServer(t *testing.T) (*parked, *net.TCPConn) {
 		p.entered <- struct{}{}
 		<-p.release
 	})}
-	engine, err := New(srv, ln, Policy{KeepAlive: func() bool { return true }})
+	engine, err := New(srv, Policy{KeepAlive: func() bool { return true }})
 	if err != nil {
 		ln.Close()
 		t.Fatal(err)

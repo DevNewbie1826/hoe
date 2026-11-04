@@ -178,7 +178,7 @@ func TestPlacementPoliciesBalanceFailedAdoption(t *testing.T) {
 				t.Fatal(err)
 			}
 			completions := 0
-			err = g.AdoptAsync(fd, func(error) { completions++ })
+			err = g.AdoptAsync(fd, nil, func(error) { completions++ })
 			if !errors.Is(err, net.ErrClosed) {
 				t.Fatalf("closed-group adoption err=%v want net.ErrClosed", err)
 			}
@@ -365,7 +365,7 @@ func newGatedGroup(t *testing.T, env string) (*Group, *gateHandler) {
 	if _, err := syscall.Write(gatePeer, []byte("x")); err != nil {
 		t.Fatal(err)
 	}
-	if err := g.AdoptAsync(gateFd, func(error) {}); err != nil {
+	if err := g.AdoptAsync(gateFd, nil, func(error) {}); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -388,7 +388,7 @@ func TestPlacementPoliciesDrainCommandFIFO(t *testing.T) {
 			completions := make(chan int, burst)
 			for i := range burst {
 				fd, _ := socketpair(t)
-				if err := g.AdoptAsync(fd, func(error) { completions <- i }); err != nil {
+				if err := g.AdoptAsync(fd, nil, func(error) { completions <- i }); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -422,7 +422,7 @@ func TestPlacementPoliciesAdoptBeforeShutdownOrder(t *testing.T) {
 			g, h := newGatedGroup(t, p.env)
 			fd, _ := socketpair(t)
 			completed := make(chan error, 1)
-			if err := g.AdoptAsync(fd, func(err error) { completed <- err }); err != nil {
+			if err := g.AdoptAsync(fd, nil, func(err error) { completed <- err }); err != nil {
 				t.Fatal(err)
 			}
 			// Adoption and stop share the parked reactor's next drain pass.

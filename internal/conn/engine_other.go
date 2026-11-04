@@ -18,12 +18,15 @@ type Engine struct{}
 func Supported() bool { return false }
 
 // New reports an unsupported event engine platform.
-func New(*http.Server, *net.TCPListener, Policy) (*Engine, error) {
+func New(*http.Server, Policy) (*Engine, error) {
 	return nil, poll.ErrUnsupported
 }
 
 // Serve reports an unsupported event engine platform.
 func (*Engine) Serve(*net.TCPListener) error { return poll.ErrUnsupported }
+
+// ServeAll reports an unsupported event engine platform.
+func (*Engine) ServeAll(...*net.TCPListener) error { return poll.ErrUnsupported }
 
 // Shutdown has no engine resources on this platform.
 func (*Engine) Shutdown(context.Context) error { return nil }

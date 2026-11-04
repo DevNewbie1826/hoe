@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -111,20 +112,31 @@ func (s *Server) ListenAndServeTLS(certFile, keyFile string) error {
 	return s.serving().ListenAndServeTLS(certFile, keyFile)
 }
 
+// engineEligible reports whether l can be served by the native HTTP/1 event
+// engine. It is the single engine-versus-net/http decision shared by Serve
+// and ServeAll: only plaintext TCP listeners on supported platforms whose
+// protocol set is plain HTTP/1 qualify.
+func (s *Server) engineEligible(l net.Listener) bool {
+	if _, ok := l.(*net.TCPListener); !ok || !conn.Supported() {
+		return false
+	}
+	return s.Protocols == nil || !s.Protocols.UnencryptedHTTP2() && s.Protocols.HTTP1()
+}
+
 // Serve serves requests on l and closes l on return.
 // It always returns a non-nil error.
 func (s *Server) Serve(l net.Listener) error {
-	tcp, ok := l.(*net.TCPListener)
-	if !ok || !conn.Supported() || s.Protocols != nil && (s.Protocols.UnencryptedHTTP2() || !s.Protocols.HTTP1()) {
+	if !s.engineEligible(l) {
 		return s.serving().Serve(l)
 	}
+	tcp := l.(*net.TCPListener)
 	defer l.Close()
 	s.mu.Lock()
 	if s.shutting.Load() {
 		s.mu.Unlock()
 		return ErrServerClosed
 	}
-	e, err := conn.New(s.serving(), tcp, conn.Policy{
+	e, err := conn.New(s.serving(), conn.Policy{
 		KeepAlive:          func() bool { return !s.noKeepAlive.Load() && !s.shutting.Load() },
 		PipelineFlushDelay: s.PipelineFlushDelay,
 	})
@@ -141,6 +153,97 @@ func (s *Server) Serve(l net.Listener) error {
 	err = e.Serve(tcp)
 	if !errors.Is(err, ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 		e.Close()
+	}
+	return err
+}
+
+// ServeAll serves requests on every listener. Engine-eligible listeners
+// share one native HTTP/1 engine — one loop group sized by
+// runtime.GOMAXPROCS(0), one worker pool per reactor, one deadline wheel —
+// so N listeners pay one engine's scheduling cost instead of N engines'.
+// Every engine-eligible listener is reserved before any acceptance starts
+// and is closed when ServeAll returns, like Serve; listeners Serve would
+// hand to net/http are served by net/http and keep its listener semantics.
+//
+// BaseContext is called once per listener before acceptance starts, and
+// connections adopted from a listener carry that listener's base context. A
+// permanent accept error on one listener stops only that listener's
+// acceptance; ServeAll returns when every listener has stopped, with the
+// errors joined. It always returns a non-nil error, ErrServerClosed after
+// Shutdown or Close.
+func (s *Server) ServeAll(listeners ...net.Listener) error {
+	if len(listeners) == 0 {
+		return errors.New("hoe: ServeAll requires at least one listener")
+	}
+	var engineListeners []*net.TCPListener
+	var stdListeners []net.Listener
+	for _, l := range listeners {
+		if s.engineEligible(l) {
+			engineListeners = append(engineListeners, l.(*net.TCPListener))
+		} else {
+			stdListeners = append(stdListeners, l)
+		}
+	}
+	// Like Serve and like net/http's Serve, ServeAll takes over every handed
+	// listener and closes it on return, the early returns below included.
+	// The accept loops and net/http's Serve close them again on the normal
+	// path; a second Close of an already-closed listener is harmless.
+	defer func() {
+		for _, l := range listeners {
+			l.Close()
+		}
+	}()
+	if s.shutting.Load() {
+		return ErrServerClosed
+	}
+	var eng *conn.Engine
+	if len(engineListeners) != 0 {
+		s.mu.Lock()
+		if s.shutting.Load() {
+			s.mu.Unlock()
+			return ErrServerClosed
+		}
+		var err error
+		eng, err = conn.New(s.serving(), conn.Policy{
+			KeepAlive:          func() bool { return !s.noKeepAlive.Load() && !s.shutting.Load() },
+			PipelineFlushDelay: s.PipelineFlushDelay,
+			Loops:              runtime.GOMAXPROCS(0),
+		})
+		if err != nil {
+			s.mu.Unlock()
+			return err
+		}
+		if s.engines == nil {
+			s.engines = make(map[*conn.Engine]struct{})
+		}
+		s.engines[eng] = struct{}{}
+		s.usingEngine.Store(true)
+		s.mu.Unlock()
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, len(listeners))
+	if eng != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- eng.ServeAll(engineListeners...)
+		}()
+	}
+	for _, l := range stdListeners {
+		wg.Add(1)
+		go func(l net.Listener) {
+			defer wg.Done()
+			errs <- s.serving().Serve(l)
+		}(l)
+	}
+	wg.Wait()
+	close(errs)
+	var err error
+	for e := range errs {
+		err = errors.Join(err, e)
+	}
+	if eng != nil && !errors.Is(err, ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+		eng.Close()
 	}
 	return err
 }
