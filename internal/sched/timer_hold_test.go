@@ -2,7 +2,6 @@ package sched
 
 import (
 	"runtime"
-	"strings"
 	"testing"
 	"time"
 )
@@ -21,18 +20,11 @@ func TestBlockedWorkersRetainNoTimer(t *testing.T) {
 		close(release)
 		p.Close()
 	})
-	// Delta, not an absolute zero: timers allocated by earlier tests stay in
-	// the in-use profile until a GC publishes the free. A stopped timer is
-	// still a Pool.run heap object until that publish. Sample until the
-	// baseline stops moving, then require these blocked workers to add none.
-	before := runTimerBytes()
-	for range 4 {
-		next := runTimerBytes()
-		if next == before {
-			break
-		}
-		before = next
-	}
+	// Delta around the operation only, on the cumulative allocation profile:
+	// fully-freed buckets stay in the profile, frees cannot shrink it, and
+	// no sched test leaves a worker running (pools join on Close; none
+	// detaches), so only this window can move the delta.
+	before := poolRunTimerAllocBytes()
 	entered := make(chan struct{}, 8)
 	for range 8 {
 		if !p.Submit(func() {
@@ -45,45 +37,7 @@ func TestBlockedWorkersRetainNoTimer(t *testing.T) {
 	for range 8 {
 		await(t, entered)
 	}
-	after := runTimerBytes()
-	if got := before - after; got != 0 {
-		t.Fatalf("blocked workers retain %d bytes allocated by Pool.run, want 0", after-before)
+	if got := poolRunTimerAllocBytes() - before; got != 0 {
+		t.Fatalf("blocked workers allocated %d Pool.run timer bytes, want 0", got)
 	}
-}
-
-func runTimerBytes() int64 {
-	runtime.GC()
-	var recs []runtime.MemProfileRecord
-	for {
-		n, ok := runtime.MemProfile(recs, false)
-		if ok {
-			recs = recs[:n]
-			break
-		}
-		recs = make([]runtime.MemProfileRecord, n+16)
-	}
-	var sum int64
-	for i := range recs {
-		if recs[i].InUseBytes() == 0 {
-			continue
-		}
-		var run, timer bool
-		frames := runtime.CallersFrames(recs[i].Stack())
-		for {
-			fr, more := frames.Next()
-			if strings.Contains(fr.Function, "(*Pool).run") {
-				run = true
-			}
-			if strings.Contains(fr.Function, "NewTimer") || strings.Contains(fr.Function, "newTimer") {
-				timer = true
-			}
-			if !more {
-				break
-			}
-		}
-		if run && timer {
-			sum += recs[i].InUseBytes()
-		}
-	}
-	return sum
 }
