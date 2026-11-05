@@ -22,6 +22,12 @@ func (logWriter) Write(p []byte) (int, error) { log.Print(string(p)); return len
 func (c *Conn) Hijack(in *bufio.Reader) (net.Conn, *bufio.ReadWriter, error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
+	// Responses already accepted in this round must reach the peer before the
+	// descriptor is handed to the handler; the hold's best-effort close path
+	// would drop them.
+	if err := c.hold.Flush(); err != nil {
+		return nil, nil, err
+	}
 	if err := c.endPipelineLifetime(); err != nil {
 		return nil, nil, err
 	}

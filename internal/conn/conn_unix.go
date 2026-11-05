@@ -47,6 +47,7 @@ type Conn struct {
 	timerArmed                  atomic.Bool
 	pipelineHooks               PipelineHooks
 	pipeline                    pipelineHold
+	hold                        roundHold
 }
 
 func (c *Conn) setState(s http.ConnState) {
@@ -167,7 +168,7 @@ func (c *Conn) deadline(op string) (time.Time, <-chan struct{}) {
 }
 
 func (c *Conn) wait(op string, ready <-chan struct{}) error {
-	if err := c.PushPipeline(); err != nil {
+	if err := c.pushPipelineNow(); err != nil {
 		return err
 	}
 	for {

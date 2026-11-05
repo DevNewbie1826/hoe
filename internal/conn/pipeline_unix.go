@@ -41,26 +41,42 @@ func (c *Conn) pipelineWrite(b []byte) (int, error) {
 	p := &c.pipeline
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	n, err := c.raw.Writev([][]byte{b})
-	if n > 0 && p.holding && !p.armed {
-		p.armed = true
-		p.generation++
-		generation := p.generation
-		controlled := false
-		if hook := c.pipelineHooks.Timer; hook != nil {
-			controlled = hook(c.engine.pipelineDelay, func() { c.expirePipeline(generation, false) })
-		}
-		if !controlled {
-			p.timerGeneration = generation
-			p.timerPending = true
-			if p.timer == nil {
-				p.timer = time.AfterFunc(c.engine.pipelineDelay, c.pipelineTimerExpired)
-			} else {
-				p.timer.Reset(c.engine.pipelineDelay)
-			}
-		}
+	return c.raw.Writev([][]byte{b})
+}
+
+// armPipeline starts the cap timer once held bytes exist, so a response
+// sitting in the round hold is still delivered within the cap.
+func (c *Conn) armPipeline() {
+	p := &c.pipeline
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.holding || p.armed || p.terminal {
+		return
 	}
-	return n, err
+	p.armed = true
+	p.generation++
+	generation := p.generation
+	controlled := false
+	if hook := c.pipelineHooks.Timer; hook != nil {
+		controlled = hook(c.engine.pipelineDelay, func() { c.expirePipeline(generation, false) })
+	}
+	if controlled {
+		return
+	}
+	p.timerGeneration = generation
+	p.timerPending = true
+	if p.timer == nil {
+		p.timer = time.AfterFunc(c.engine.pipelineDelay, c.pipelineTimerExpired)
+	} else {
+		p.timer.Reset(c.engine.pipelineDelay)
+	}
+}
+
+func (c *Conn) pipelineHolding() bool {
+	p := &c.pipeline
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.holding && !p.terminal
 }
 
 func (c *Conn) pipelineTimerExpired() {
@@ -78,6 +94,9 @@ func (c *Conn) expirePipeline(generation uint64, runtimeTimer bool) {
 	if hook := c.pipelineHooks.BeforeExpiry; hook != nil {
 		hook()
 	}
+	// Drain held bytes before taking the pipeline lock: the flush needs the
+	// connection write path, which acquires pipeline itself.
+	holdErr := c.hold.Flush()
 	p := &c.pipeline
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -91,6 +110,9 @@ func (c *Conn) expirePipeline(generation uint64, runtimeTimer bool) {
 		return
 	}
 	if err := c.pushPipelineLocked(true); err != nil {
+		c.raw.Close()
+	}
+	if holdErr != nil {
 		c.raw.Close()
 	}
 }
@@ -109,9 +131,18 @@ func (c *Conn) pushPipelineLocked(expired bool) error {
 	return err
 }
 
-// PushPipeline releases kernel-held output before an explicit flush or wait.
-// The rest of the current read round remains uncorked.
+// PushPipeline releases kernel-held output before an explicit flush. It
+// drains the round hold first, so a released cork never orders ahead of bytes
+// the round has not written yet. Conn.Write's wait path uses pushPipelineNow
+// instead: it already owns the write lock and holds nothing to drain.
 func (c *Conn) PushPipeline() error {
+	if err := c.hold.Flush(); err != nil {
+		return err
+	}
+	return c.pushPipelineNow()
+}
+
+func (c *Conn) pushPipelineNow() error {
 	p := &c.pipeline
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -132,6 +163,9 @@ func (c *Conn) finishPipelineResponse() error {
 
 // endPipelineLifetime invalidates callbacks before descriptor close/detach.
 func (c *Conn) endPipelineLifetime() error {
+	// Bytes already accepted from handlers should still reach the kernel, but
+	// this path runs during Close: never wait for a peer that is not reading.
+	c.hold.flushBestEffort()
 	p := &c.pipeline
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -142,7 +176,24 @@ func (c *Conn) endPipelineLifetime() error {
 	return c.pushPipelineLocked(false)
 }
 
+// writeHeldNow makes one non-blocking attempt to write held bytes. A peer that
+// is not reading loses them, which is the only sound choice while closing.
+func (c *Conn) writeHeldNow(p []byte) {
+	if len(p) == 0 || !c.writeMu.TryLock() {
+		return
+	}
+	defer c.writeMu.Unlock()
+	n, _ := c.raw.Writev([][]byte{p})
+	_ = n
+}
+
 func (c *Conn) endPipelineRound() {
+	// Held bytes must reach the kernel before the push releases the cork,
+	// otherwise the release would order ahead of the round's output.
+	if err := c.hold.Flush(); err != nil {
+		c.Close()
+		return
+	}
 	if err := c.PushPipeline(); err != nil {
 		c.Close()
 	}
