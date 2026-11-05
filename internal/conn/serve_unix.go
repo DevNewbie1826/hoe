@@ -44,11 +44,14 @@ func acquireRequestIO(c *Conn) *requestIO {
 	if c.readerDemand.Load() {
 		return bigRequestIOPool.Get().(*requestIO)
 	}
-	return smallRequestIOPool.Get().(*requestIO)
+	b := smallRequestIOPool.Get().(*requestIO)
+	c.smallReaderLoans++
+	return b
 }
 
-func releaseRequestIO(b *requestIO) {
+func releaseRequestIO(c *Conn, b *requestIO) {
 	if b.small {
+		c.smallReaderReleases++
 		smallRequestIOPool.Put(b)
 		return
 	}
@@ -76,6 +79,9 @@ func (d *demandReader) Read(p []byte) (int, error) {
 	n, err := d.c.Read(p)
 	if n >= smallReaderSize {
 		d.c.readerDemand.Store(true)
+	}
+	if d.c.bodyReadsOn && n > d.c.bodyReadMax {
+		d.c.bodyReadMax = n
 	}
 	return n, err
 }
@@ -201,7 +207,8 @@ func (c *Conn) growRequestIO(buffers *requestIO, source io.Reader) *requestIO {
 	}
 	grown.in.Reset(source)
 	buffers.in.Reset(nil)
-	releaseRequestIO(buffers)
+	releaseRequestIO(c, buffers)
+	c.readerBytes = grown.in.Size()
 	return grown
 }
 
@@ -213,7 +220,7 @@ func (c *Conn) round() {
 		if buffers != nil {
 			buffers.in.Reset(nil)
 			output.ReleaseResponseOutput()
-			releaseRequestIO(buffers)
+			releaseRequestIO(c, buffers)
 		}
 	}()
 	defer func() {
@@ -284,6 +291,7 @@ func (c *Conn) round() {
 			buffers = acquireRequestIO(c)
 			in = buffers.in
 			in.Reset(buffers.source(c))
+			c.readerBytes = in.Size()
 		}
 		served := c.serveRequest(&buffers, output, first)
 		in = buffers.in
@@ -369,6 +377,8 @@ func (c *Conn) readHead() (bool, error) {
 // runs, so a panic unwinds with round() owning exactly the live reader.
 func (c *Conn) serveRequest(bp **requestIO, output *roundOutput, first bool) bool {
 	in := (*bp).in
+	c.bodyReadsOn = false
+	c.bodyReadMax = 0
 	r, err := http1.ReadRequest(in, c.engine.server.MaxHeaderBytes)
 	if err != nil {
 		if flushErr := c.hold.Flush(); flushErr != nil {
@@ -379,6 +389,8 @@ func (c *Conn) serveRequest(bp **requestIO, output *roundOutput, first bool) boo
 		c.Close()
 		return false
 	}
+	// The head is consumed; delivered reads from here on are body bytes.
+	c.bodyReadsOn = true
 	// Only hold a round when another complete head is already buffered.
 	// Skip a known-length body; chunked bodies have no known next-head offset.
 	// Eligibility is checked once, so a release never re-corks this round.

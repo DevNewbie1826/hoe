@@ -21,18 +21,33 @@ import (
 // Conn is the stable net.Conn identity reported throughout an HTTP lifetime.
 // Blocking I/O waits for loop-published edges; idle sockets retain no buffers.
 type Conn struct {
-	engine                      *Engine
-	raw                         *loop.Conn
-	local, remote               *net.TCPAddr
-	remoteName                  string
-	base                        context.Context
-	state                       atomic.Int32
-	mu                          sync.Mutex
-	cancel                      interface{ Cancel() }
-	eof                         bool
-	bodyDone                    bool
-	serving                     bool
-	readerDemand                atomic.Bool // read rounds go big once a read fills the small reader
+	engine        *Engine
+	raw           *loop.Conn
+	local, remote *net.TCPAddr
+	remoteName    string
+	base          context.Context
+	state         atomic.Int32
+	mu            sync.Mutex
+	cancel        interface{ Cancel() }
+	eof           bool
+	bodyDone      bool
+	serving       bool
+	readerDemand  atomic.Bool // read rounds go big once a read fills the small reader
+	// Test-visible reader state, written and read on the round goroutine.
+	// readerBytes is the backing size of the reader serving the current
+	// request; bodyReadMax is the largest head-excluded delivered read of
+	// the current request while the small reader serves it (demandReader
+	// wraps only small readers, so a promoted reader bypasses the count and
+	// bodyReadMax stays 0 — the measurement exists to pin the small-reader
+	// demand threshold); the loan counters track this connection's small
+	// readers, so the pre-promotion release is observable. In-package tests
+	// read these only while the round parks in a handler or from inside the
+	// handler itself.
+	readerBytes                 int
+	bodyReadMax                 int
+	bodyReadsOn                 bool
+	smallReaderLoans            int
+	smallReaderReleases         int
 	headStart                   time.Time
 	accepted                    time.Time
 	readDeadline, writeDeadline time.Time
