@@ -214,10 +214,6 @@ func (e *Engine) adopt(fd int, l *net.TCPListener) error {
 	}
 	e.opening++
 	e.mu.Unlock()
-	if st == nil {
-		// Adoptions outside a running Serve carry no listener base context.
-		st = &listenerState{base: context.Background()}
-	}
 	st.adoptions.Add(1)
 	if err := e.group.AdoptAsync(fd, st.base, func(err error) { e.adopted(err, l, st) }); err != nil {
 		e.adopted(err, l, st)
