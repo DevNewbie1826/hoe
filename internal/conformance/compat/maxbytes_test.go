@@ -7,7 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -16,9 +16,114 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 )
 
-var dateLine = regexp.MustCompile(`(?m)^Date: [^\r]*\r$`)
+var headerEnd = []byte("\r\n\r\n")
 
-func normalize(p []byte) []byte { return dateLine.ReplaceAll(p, []byte("Date: DATE\r")) }
+func normalize(p []byte) []byte {
+	out := make([]byte, 0, len(p))
+	for len(p) > 0 {
+		i := bytes.Index(p, headerEnd)
+		if i < 0 || !bytes.HasPrefix(p, []byte("HTTP/")) {
+			return append(out, p...)
+		}
+		head, rest := p[:i+len(headerEnd)], p[i+len(headerEnd):]
+		out = append(out, rewriteDate(head)...)
+		code, chunked, length := framing(head)
+		switch {
+		case code == 101:
+			return append(out, rest...)
+		case code/100 == 1 || code == 204 || code == 304:
+			p = rest
+		case chunked:
+			n, ok := skipChunks(rest)
+			if !ok {
+				return append(out, rest...)
+			}
+			out = append(out, rest[:n]...)
+			p = rest[n:]
+		case length >= 0:
+			if length >= int64(len(rest)) {
+				return append(out, rest...)
+			}
+			out = append(out, rest[:length]...)
+			p = rest[length:]
+		default:
+			return append(out, rest...)
+		}
+	}
+	return out
+}
+
+func rewriteDate(head []byte) []byte {
+	lines := bytes.Split(head, []byte("\r\n"))
+	for i, line := range lines {
+		value, ok := bytes.CutPrefix(line, []byte("Date: "))
+		if !ok {
+			continue
+		}
+		t, err := http.ParseTime(string(value))
+		if err == nil && t.Format(http.TimeFormat) == string(value) {
+			lines[i] = []byte("Date: DATE")
+		}
+	}
+	return bytes.Join(lines, []byte("\r\n"))
+}
+
+func framing(head []byte) (code int, chunked bool, length int64) {
+	length = -1
+	lines := bytes.Split(head, []byte("\r\n"))
+	if f := bytes.Fields(lines[0]); len(f) >= 2 {
+		code, _ = strconv.Atoi(string(f[1]))
+	}
+	for _, line := range lines[1:] {
+		name, value, ok := bytes.Cut(line, []byte(":"))
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(string(bytes.TrimSpace(name))) {
+		case "transfer-encoding":
+			chunked = strings.Contains(strings.ToLower(string(value)), "chunked")
+		case "content-length":
+			if n, err := strconv.ParseInt(strings.TrimSpace(string(value)), 10, 64); err == nil {
+				length = n
+			}
+		}
+	}
+	return code, chunked, length
+}
+
+func skipChunks(p []byte) (int, bool) {
+	for i := 0; ; {
+		j := bytes.Index(p[i:], []byte("\r\n"))
+		if j < 0 {
+			return 0, false
+		}
+		size := p[i : i+j]
+		if k := bytes.IndexByte(size, ';'); k >= 0 {
+			size = size[:k]
+		}
+		n, err := strconv.ParseInt(strings.TrimSpace(string(size)), 16, 64)
+		if err != nil || n < 0 {
+			return 0, false
+		}
+		i += j + 2
+		if n == 0 {
+			for {
+				k := bytes.Index(p[i:], []byte("\r\n"))
+				if k < 0 {
+					return 0, false
+				}
+				if k == 0 {
+					return i + 2, true
+				}
+				i += k + 2
+			}
+		}
+		if int64(len(p)-i) < n+2 {
+			return 0, false
+		}
+		i += int(n) + 2
+	}
+}
 
 type running struct {
 	addr string
