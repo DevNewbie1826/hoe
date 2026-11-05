@@ -1,6 +1,7 @@
 package hoe
 
 import (
+	"context"
 	"net"
 	"net/http"
 )
@@ -30,7 +31,16 @@ func (s *Server) serving() *http.Server {
 		s.std.TLSNextProto = s.TLSNextProto
 		s.std.ConnState = s.ConnState
 		s.std.ErrorLog = s.ErrorLog
-		s.std.BaseContext = s.BaseContext
+		// net/http reads BaseContext once per Serve, so this trampoline keeps
+		// the user hook's per-Serve/per-listener read. The field is assigned
+		// only here, inside the Once, so concurrent Serves never race on it,
+		// and a nil hook maps to context.Background() as net/http does.
+		s.std.BaseContext = func(l net.Listener) context.Context {
+			if fn := s.BaseContext; fn != nil {
+				return fn(l)
+			}
+			return context.Background()
+		}
 		s.std.ConnContext = s.ConnContext
 		s.std.HTTP2 = s.HTTP2
 		s.std.Protocols = s.Protocols

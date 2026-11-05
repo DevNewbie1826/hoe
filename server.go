@@ -20,7 +20,12 @@ var ErrServerClosed = http.ErrServerClosed
 
 // Server defines the Go 1.25 http.Server configuration and lifecycle.
 // Its zero value is ready to serve. Configure fields before starting serving;
-// do not copy a Server after first use.
+// do not copy a Server after first use. BaseContext is the exception: it is
+// read when each serving call starts, so assigning it between serving calls
+// takes effect as in net/http. Assigning it concurrently with a running
+// serving call is not supported, as in net/http. The other configuration
+// fields are not re-read for each serving call: configure them before serving,
+// and do not change them while a serving call is running.
 //
 // The HTTP/1 engine has two owner-approved compatibility exceptions, both
 // for a MaxBytesReader that is not reachable from the served Request.Body:
@@ -68,8 +73,12 @@ type Server struct {
 	ConnState func(net.Conn, http.ConnState)
 	// ErrorLog receives server errors; nil uses the standard logger.
 	ErrorLog *log.Logger
-	// BaseContext supplies a non-nil base context for each listener.
-	// Nil uses context.Background.
+	// BaseContext supplies a base context for each listener. It is read each
+	// time a serving call starts (Serve, ServeAll, ServeTLS, ListenAndServeTLS),
+	// once per listener, so assigning it between serving calls takes effect as
+	// in net/http; assigning it concurrently with a running serving call is not
+	// supported. Nil means context.Background, and a non-nil function must
+	// return a non-nil context.
 	BaseContext func(net.Listener) context.Context
 	// ConnContext derives a non-nil context for a newly accepted connection.
 	ConnContext func(context.Context, net.Conn) context.Context
@@ -178,12 +187,12 @@ func (s *Server) Serve(l net.Listener) error {
 // and is closed when ServeAll returns, like Serve; listeners Serve would
 // hand to net/http are served by net/http and keep its listener semantics.
 //
-// BaseContext is called once per listener before acceptance starts, and
-// connections adopted from a listener carry that listener's base context. A
-// permanent accept error on one listener stops only that listener's
-// acceptance; ServeAll returns when every listener has stopped, with the
-// errors joined. It always returns a non-nil error, ErrServerClosed after
-// Shutdown or Close.
+// BaseContext is read when ServeAll starts, once per listener before
+// acceptance starts, and connections adopted from a listener carry that
+// listener's base context. A permanent accept error on one listener stops
+// only that listener's acceptance; ServeAll returns when every listener has
+// stopped, with the errors joined. It always returns a non-nil error,
+// ErrServerClosed after Shutdown or Close.
 func (s *Server) ServeAll(listeners ...net.Listener) error {
 	if len(listeners) == 0 {
 		return errors.New("hoe: ServeAll requires at least one listener")

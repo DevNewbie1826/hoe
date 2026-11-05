@@ -128,6 +128,7 @@ func pipeline(addr string, connections, depth int, duration time.Duration) (floa
 		firstByte.merge(item.firstByte)
 		drain.merge(item.drain)
 	}
+	// batches is the number of pipeline rounds measured, one write sample per round per connection, summed across connections - it is a measurement, not a constant.
 	fmt.Printf("TRACE pipeline c=%d depth=%d batches=%d dial_p50_us=%.1f dial_max_us=%.1f write_p50_us=%.1f write_max_us=%.1f firstbyte_p50_us=%.1f firstbyte_max_us=%.1f drain_p50_us=%.1f drain_max_us=%.1f\n",
 		connections, depth, write.n,
 		dial.p50us(), dial.maxus(),
@@ -157,13 +158,11 @@ func (h *stageHist) add(d time.Duration) {
 }
 
 func (h *stageHist) merge(o stageHist) {
-	if o.n == 0 {
-		return
-	}
 	for i := range h.buckets {
 		h.buckets[i] += o.buckets[i]
 	}
-	if h.n == 0 || o.max > h.max {
+	// An empty operand must not contribute a zero max: a receiver of only negative samples would otherwise gain one.
+	if o.n > 0 && (h.n == 0 || o.max > h.max) {
 		h.max = o.max
 	}
 	h.n += o.n
@@ -192,7 +191,8 @@ func (h *stageHist) p50us() float64 {
 		}
 		return float64(hi) / 1000
 	}
-	return float64(h.max) / 1000
+	// add bumps one bucket and merge sums buckets with n, so a consistent histogram always returns here.
+	panic("stageHist: bucket sum below sample count")
 }
 
 func (h *stageHist) maxus() float64 {
