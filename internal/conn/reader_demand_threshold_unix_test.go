@@ -167,10 +167,10 @@ func TestReaderDemandThreshold1024MarksDemand(t *testing.T) {
 	default:
 	}
 	if !c.readerDemand.Load() {
-		t.Fatal("a delivered 1024-byte body read did not mark reader demand")
+		t.Fatalf("a 1024-byte body write did not mark reader demand (loopback write may have been split across reads; largest delivered body read = %d)", c.bodyReadMax)
 	}
 	if c.bodyReadMax != 1024 {
-		t.Fatalf("largest head-excluded body read = %d, want exactly 1024", c.bodyReadMax)
+		t.Fatalf("largest head-excluded body read = %d, want exactly 1024 (a split loopback delivery lowers the largest single read)", c.bodyReadMax)
 	}
 	if c.readerBytes != 1024 {
 		t.Fatalf("reader serving the parked request = %d bytes, want exactly 1024", c.readerBytes)
@@ -203,7 +203,7 @@ func TestReaderDemandThreshold1023KeepsSmall(t *testing.T) {
 		t.Fatal("a delivered 1023-byte body read marked reader demand")
 	}
 	if c.bodyReadMax != 1023 {
-		t.Fatalf("largest head-excluded body read = %d, want exactly 1023", c.bodyReadMax)
+		t.Fatalf("largest head-excluded body read = %d, want exactly 1023 (loopback body write may have been split across reads)", c.bodyReadMax)
 	}
 	if c.readerBytes != 1024 {
 		t.Fatalf("reader serving the parked request = %d bytes, want exactly 1024", c.readerBytes)
