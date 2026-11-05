@@ -302,7 +302,6 @@ func (c *Conn) round() {
 func (c *Conn) readHead() (bool, error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
-	var tmp [4096]byte
 	maxHead := c.engine.server.MaxHeaderBytes
 	if maxHead <= 0 {
 		maxHead = http.DefaultMaxHeaderBytes
@@ -342,9 +341,8 @@ func (c *Conn) readHead() (bool, error) {
 				return false, err
 			}
 		}
-		n, err := c.raw.Read(tmp[:])
+		n, err := c.readIntoInput()
 		if n > 0 {
-			c.pending(tmp[:n])
 			continue
 		}
 		if interrupted(err) {

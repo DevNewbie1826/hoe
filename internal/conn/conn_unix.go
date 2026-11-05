@@ -15,6 +15,7 @@ import (
 
 	"github.com/DevNewbie1826/hoe/internal/bufpool"
 	"github.com/DevNewbie1826/hoe/internal/loop"
+	"github.com/DevNewbie1826/hoe/internal/sys"
 )
 
 // Conn is the stable net.Conn identity reported throughout an HTTP lifetime.
@@ -137,20 +138,33 @@ func (c *Conn) releaseInputLocked() {
 	c.offset = 0
 }
 
-func (c *Conn) pending(p []byte) {
-	if len(p) == 0 {
-		return
+// readIntoInput reads socket bytes straight into the retained input buffer, so
+// a head crosses the copy into the request reader instead of crossing two.
+func (c *Conn) readIntoInput() (int, error) {
+	const want = 4096
+	if c.offset > 0 || cap(c.input)-len(c.input) < want {
+		need := len(c.input) - c.offset + want
+		if cap(c.input) < need {
+			b := bufpool.Get(need)
+			n := copy(b, c.input[c.offset:])
+			c.releaseInputLocked()
+			c.input = b[:n]
+		} else {
+			n := copy(c.input, c.input[c.offset:])
+			c.input = c.input[:n]
+			c.offset = 0
+		}
 	}
-	need := len(c.input) - c.offset + len(p)
-	if c.offset == 0 && need <= cap(c.input) {
-		c.input = append(c.input, p...)
-		return
+	free := c.input[len(c.input):cap(c.input)]
+	if len(free) > want {
+		free = free[:want]
 	}
-	b := bufpool.Get(max(4096, need))
-	n := copy(b, c.input[c.offset:])
-	n += copy(b[n:], p)
-	c.releaseInputLocked()
-	c.input = b[:n]
+	n, err := c.raw.Read(free)
+	if n > 0 {
+		c.input = c.input[:len(c.input)+n]
+		sys.CountReadInto(n)
+	}
+	return n, err
 }
 
 func (c *Conn) timeoutError(op string) error {

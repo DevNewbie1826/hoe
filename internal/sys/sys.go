@@ -21,11 +21,17 @@ type Counters struct {
 	SpliceBytes uint64
 	// WritevCalls counts attempted nonempty writev syscalls.
 	WritevCalls uint64
+	// ReadIntoCalls counts socket reads that filled the retained input buffer
+	// directly instead of staging through a scratch copy.
+	ReadIntoCalls uint64
+	// ReadIntoBytes counts bytes those reads delivered.
+	ReadIntoBytes uint64
 	// PushCalls counts explicit kernel cork push attempts, not enable/probe calls.
 	PushCalls uint64
 }
 
 var sendfileCalls, sendfileBytes, spliceCalls, spliceBytes, writevCalls atomic.Uint64
+var readIntoCalls, readIntoBytes atomic.Uint64
 var pushCalls atomic.Uint64
 
 // SnapshotCounters reads process-wide syscall accounting.
@@ -37,6 +43,8 @@ func SnapshotCounters() Counters {
 		SpliceCalls:   spliceCalls.Load(),
 		SpliceBytes:   spliceBytes.Load(),
 		WritevCalls:   writevCalls.Load(),
+		ReadIntoCalls: readIntoCalls.Load(),
+		ReadIntoBytes: readIntoBytes.Load(),
 		PushCalls:     pushCalls.Load(),
 	}
 }
@@ -48,5 +56,14 @@ func ResetCounters() {
 	spliceCalls.Store(0)
 	spliceBytes.Store(0)
 	writevCalls.Store(0)
+	readIntoCalls.Store(0)
+	readIntoBytes.Store(0)
 	pushCalls.Store(0)
+}
+
+// CountReadInto records a socket read that filled the retained input buffer
+// directly.
+func CountReadInto(n int) {
+	readIntoCalls.Add(1)
+	readIntoBytes.Add(uint64(n))
 }
