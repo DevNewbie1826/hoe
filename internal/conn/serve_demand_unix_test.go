@@ -72,7 +72,7 @@ func TestReaderDemandPolicyOnRealReads(t *testing.T) {
 	writeAll(t, client, "POST /big HTTP/1.1\r\nHost: t\r\nContent-Length: 8192\r\n\r\n"+strings.Repeat("x", 8192))
 	awaitPark(t, entered)
 	if !c.readerDemand.Load() {
-		t.Fatal("beyond-small body read did not mark reader demand")
+		t.Fatal("beyond-small body read did not mark reader demand (loopback POST write may have been split across reads; demand needs one delivered read >= 1024)")
 	}
 	release <- struct{}{}
 	if s := readResponse(t, client, "POST").Status; s != "200 OK" {

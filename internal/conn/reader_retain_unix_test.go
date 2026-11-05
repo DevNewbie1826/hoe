@@ -59,19 +59,22 @@ func TestReaderGrowsAfterBodyBeyondSmall(t *testing.T) {
 	writeRaw(t, client, "GET /after HTTP/1.1\r\nHost: t\r\n\r\n")
 	waitPark(t, srv.entered)
 	if c.readerBytes != 4096 {
-		t.Fatalf("request after a beyond-small body reader backing = %d, want 4096", c.readerBytes)
-	}
-	// Whether the POST gets its own round (loans=2, releases=2) or joins
-	// GET /small's round (loans=1, releases=1) depends on arrival timing;
-	// both are legitimate. The pin is the invariant: every small loan this
-	// connection took was returned — the pre-promotion reader did not leak —
-	// and the /after request serves from the full-size backing checked above.
-	if c.smallReaderReleases != c.smallReaderLoans || c.smallReaderReleases < 1 {
-		t.Fatalf("request after a beyond-small body small-reader loans/releases = %d/%d, want equal and >= 1", c.smallReaderLoans, c.smallReaderReleases)
+		t.Fatalf("request after a beyond-small body reader backing = %d, want 4096 (loopback POST write may have been split across reads; growth needs one delivered body read >= 1024)", c.readerBytes)
 	}
 	srv.release <- struct{}{}
 	if s := readStatus(t, client, "GET").Status; s != "200 OK" {
 		t.Fatalf("request after growth status %q", s)
+	}
+	// Whether the POST gets its own round (loans=2, releases=2) or joins
+	// GET /small's round (loans=1, releases=1) depends on arrival timing;
+	// both are legitimate. readerBytes above is written by the goroutine
+	// serving /after before its handler parks, so it is settled at the
+	// waitPark edge; the previous round's release increment has no such
+	// edge to this goroutine, so the every-loan-returned invariant is
+	// asserted only after the engine joins its workers below.
+	srv.stop()
+	if c.smallReaderReleases != c.smallReaderLoans || c.smallReaderReleases < 1 {
+		t.Fatalf("settled small-reader loans/releases = %d/%d, want equal and >= 1 (the pre-promotion reader leaked)", c.smallReaderLoans, c.smallReaderReleases)
 	}
 }
 
@@ -113,7 +116,11 @@ func parkedServer(t *testing.T) (*parked, *net.TCPConn) {
 		}),
 		ConnState: func(nc net.Conn, s http.ConnState) {
 			if s == http.StateNew {
-				p.conns <- nc.(*Conn)
+				// Drop, not block: a failing test that stops draining must not stall the accept path.
+				select {
+				case p.conns <- nc.(*Conn):
+				default:
+				}
 			}
 		},
 	}
