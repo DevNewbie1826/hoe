@@ -51,6 +51,54 @@ var responseBufferPool = sync.Pool{New: func() any {
 	return bufio.NewWriterSize(io.Discard, 2048)
 }}
 
+// headerSnapshotPool recycles the frozen copy of a handler's response headers.
+// A snapshot is internal to the codec: it is written once and never handed back
+// to a handler, so it can return to the pool when the response is released.
+var headerSnapshotPool = sync.Pool{New: func() any {
+	return make(http.Header, 8)
+}}
+
+func (w *Response) freezeHeaders() {
+	s := w.snapshot
+	if s == nil {
+		s = headerSnapshotPool.Get().(http.Header)
+		w.snapshot = s
+	}
+	for k := range s {
+		if _, keep := w.header[k]; !keep {
+			delete(s, k)
+		}
+	}
+	for k, vv := range w.header {
+		dst := s[k]
+		if cap(dst) < len(vv) {
+			dst = make([]string, len(vv))
+		}
+		dst = dst[:len(vv)]
+		copy(dst, vv)
+		s[k] = dst
+	}
+}
+
+func (w *Response) releaseSnapshot() {
+	if w.snapshot == nil {
+		return
+	}
+	// A large snapshot would pin its header bytes in the pool between
+	// requests; give those back to the collector instead of retaining them.
+	bytes := 0
+	for k, vv := range w.snapshot {
+		bytes += len(k)
+		for _, v := range vv {
+			bytes += len(v)
+		}
+	}
+	if bytes <= 4096 && len(w.snapshot) <= 32 {
+		headerSnapshotPool.Put(w.snapshot)
+	}
+	w.snapshot = nil
+}
+
 type responseOutputOwner interface {
 	AcquireResponseOutput() *bufio.Writer
 	GrowResponseOutput() *bufio.Writer
@@ -98,7 +146,7 @@ func (w *Response) Header() http.Header {
 		w.header = make(http.Header)
 	}
 	if w.status != 0 && !w.wire && w.snapshot == nil {
-		w.snapshot = w.header.Clone()
+		w.freezeHeaders()
 	}
 	w.calledHeader = true
 	return w.header
@@ -130,7 +178,7 @@ func (w *Response) WriteHeader(code int) {
 	}
 	w.status = code
 	if w.calledHeader {
-		w.snapshot = w.header.Clone()
+		w.freezeHeaders()
 	}
 	if cl := w.header.Get("Content-Length"); cl != "" {
 		n, err := strconv.ParseInt(cl, 10, 64)
@@ -250,6 +298,7 @@ func (w *Response) releaseBuffer() {
 		responseBufferPool.Put(w.buffer)
 		w.buffer = nil
 	}
+	w.releaseSnapshot()
 }
 
 // CloseAfterReply reports whether the owner must stop HTTP reuse.
