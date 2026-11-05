@@ -3,10 +3,10 @@ package ws_test
 import (
 	"net"
 	"net/http"
-	"runtime"
 	"testing"
 	"time"
 
+	"github.com/DevNewbie1826/hoe/internal/conformance/internal/goroutinebudget"
 	ws "github.com/DevNewbie1826/hoe/websocket"
 )
 
@@ -29,7 +29,7 @@ func TestIdleDistinctUpgraders(t *testing.T) {
 	var baseline int
 	for i := 0; i < count; i++ {
 		if i == 1 {
-			baseline = goroutineFloor(t)
+			baseline = goroutinebudget.Floor(t)
 		}
 		nc, br, _ := rawClient(t, addr, "")
 		clients = append(clients, nc)
@@ -48,25 +48,12 @@ func TestIdleDistinctUpgraders(t *testing.T) {
 		}
 	}
 	// The shared upgrade reactor (created on first Adopt) and the engine's L+2 population sit in the baseline;
-	// the 1ms upgrade worker and hijacked HTTP workers drain inside the 3s min-window;
+	// the 1ms upgrade worker and hijacked HTTP workers have drained because the census waits for the count to rest;
 	// the ceiling is host-size independent with a deterministic leak floor of 3 goroutines.
-	if growth := goroutineFloor(t) - baseline; growth > 2 {
+	if growth := goroutinebudget.Floor(t) - baseline; growth > 2 {
 		t.Fatalf("20 distinct Upgraders added %d goroutines over the drained baseline (max 2)", growth)
 	} else {
 		t.Logf("20 distinct Upgraders added %d goroutines over the drained baseline", growth)
 	}
 }
 
-// goroutineFloor polls runtime.NumGoroutine every 50ms across the full 3s window
-// and returns the minimum. The iteration count is the window: it never exits early.
-func goroutineFloor(t *testing.T) int {
-	t.Helper()
-	floor := runtime.NumGoroutine()
-	for range 60 {
-		time.Sleep(50 * time.Millisecond)
-		if n := runtime.NumGoroutine(); n < floor {
-			floor = n
-		}
-	}
-	return floor
-}

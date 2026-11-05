@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DevNewbie1826/hoe/internal/conformance/internal/goroutinebudget"
 	ws "github.com/DevNewbie1826/hoe/websocket"
 )
 
@@ -71,7 +72,7 @@ func TestIdle5000Connections(t *testing.T) {
 	var baseline int
 	for i := 0; i < count; i++ {
 		if i == 1 {
-			baseline = goroutineFloor(t)
+			baseline = goroutinebudget.Floor(t)
 		}
 		nc, br, _ := rawClient(t, addr, "")
 		clients = append(clients, nc)
@@ -92,9 +93,9 @@ func TestIdle5000Connections(t *testing.T) {
 		}
 	}
 	// The engine's L+2 startup population, the shared upgrade reactor sit in the baseline;
-	// transient workers (including the one that served the first connection) drain inside the 3s min-window;
+	// transient workers (including the one that served the first connection) have drained because the census waits for the count to rest;
 	// the ceiling is host-size independent with a deterministic leak floor of 3 goroutines.
-	if growth := goroutineFloor(t) - baseline; growth > 2 {
+	if growth := goroutinebudget.Floor(t) - baseline; growth > 2 {
 		t.Fatalf("5000 idle sockets added %d goroutines over the drained baseline (max 2)", growth)
 	} else {
 		t.Logf("5000 idle sockets added %d goroutines over the drained baseline", growth)
