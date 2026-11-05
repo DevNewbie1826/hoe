@@ -123,6 +123,18 @@ func (s *Server) engineEligible(l net.Listener) bool {
 	return s.Protocols == nil || !s.Protocols.UnencryptedHTTP2() && s.Protocols.HTTP1()
 }
 
+// pruneWhenDone removes e from s.engines once the engine has finished, so a
+// completed serving lifecycle leaves no engine state reachable from the
+// Server. It returns immediately; the removal happens on its own goroutine.
+func (s *Server) pruneWhenDone(e *conn.Engine) {
+	go func() {
+		<-e.Done()
+		s.mu.Lock()
+		delete(s.engines, e)
+		s.mu.Unlock()
+	}()
+}
+
 // Serve serves requests on l and closes l on return.
 // It always returns a non-nil error.
 func (s *Server) Serve(l net.Listener) error {
@@ -154,6 +166,7 @@ func (s *Server) Serve(l net.Listener) error {
 	if !errors.Is(err, ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 		e.Close()
 	}
+	s.pruneWhenDone(e)
 	return err
 }
 
@@ -246,12 +259,7 @@ func (s *Server) ServeAll(listeners ...net.Listener) error {
 		eng.Close()
 	}
 	if eng != nil {
-		go func(e *conn.Engine) {
-			<-e.Done()
-			s.mu.Lock()
-			delete(s.engines, e)
-			s.mu.Unlock()
-		}(eng)
+		s.pruneWhenDone(eng)
 	}
 	return err
 }
