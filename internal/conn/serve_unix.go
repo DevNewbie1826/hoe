@@ -96,7 +96,18 @@ type roundOutput struct {
 	*Conn
 	out     *bufio.Writer
 	corked  bool
+	batched bool
 	cleanup func()
+}
+
+// sink selects the writer loan's destination: a held round buffers in the
+// connection's hold and flushes once, an uncorked round writes straight
+// through.
+func (r *roundOutput) sink() io.Writer {
+	if r.batched {
+		return &r.Conn.hold
+	}
+	return r.Conn
 }
 
 func (r *roundOutput) acquireCork() {
@@ -105,8 +116,12 @@ func (r *roundOutput) acquireCork() {
 	}
 	if r.engine.pendingOutput.Add(64<<10) <= maxPendingOutput {
 		r.corked = true
+		if r.Conn.pipelineHolding() {
+			r.Conn.hold.start(r.Conn)
+			r.batched = true
+		}
 		r.out = corkWriterPool.Get().(*bufio.Writer)
-		r.out.Reset(r.Conn)
+		r.out.Reset(r.sink())
 	} else {
 		r.engine.pendingOutput.Add(-(64 << 10))
 	}
@@ -115,7 +130,7 @@ func (r *roundOutput) acquireCork() {
 func (r *roundOutput) AcquireResponseOutput() *bufio.Writer {
 	if r.out == nil {
 		r.out = outputWriterPool.Get().(*bufio.Writer)
-		r.out.Reset(r.Conn)
+		r.out.Reset(r.sink())
 	}
 	return r.out
 }
@@ -136,6 +151,10 @@ func (r *roundOutput) ReleaseResponseOutput() {
 		return
 	}
 	r.out.Reset(io.Discard)
+	if r.batched {
+		r.Conn.hold.release()
+		r.batched = false
+	}
 	if r.corked {
 		corkWriterPool.Put(r.out)
 		r.engine.pendingOutput.Add(-(64 << 10))
@@ -234,6 +253,12 @@ func (c *Conn) round() {
 			ready, err = c.readHead()
 		}
 		if err != nil {
+			// Held responses precede this error on the wire; an error reply
+			// must not overtake bytes the round already accepted.
+			if flushErr := c.hold.Flush(); flushErr != nil {
+				c.Close()
+				return
+			}
 			if writeErr := http1.WriteError(c, err); writeErr != nil {
 				c.cancelRequest()
 			}
@@ -346,6 +371,10 @@ func (c *Conn) serveRequest(bp **requestIO, output *roundOutput, first bool) boo
 	in := (*bp).in
 	r, err := http1.ReadRequest(in, c.engine.server.MaxHeaderBytes)
 	if err != nil {
+		if flushErr := c.hold.Flush(); flushErr != nil {
+			c.Close()
+			return false
+		}
 		http1.WriteError(c, err)
 		c.Close()
 		return false
