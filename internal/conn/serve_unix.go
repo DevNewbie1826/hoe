@@ -276,6 +276,7 @@ func (c *Conn) round() {
 			return
 		}
 		if !ready {
+			c.parkedInput()
 			return
 		}
 		first := buffers == nil
@@ -295,6 +296,7 @@ func (c *Conn) round() {
 			buffers = c.growRequestIO(buffers, c)
 			in = buffers.in
 		}
+		c.parkedInput()
 	}
 }
 

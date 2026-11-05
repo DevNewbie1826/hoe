@@ -138,6 +138,16 @@ func (c *Conn) releaseInputLocked() {
 	c.offset = 0
 }
 
+// parkedInput releases the input loan when a finishing round retains nothing,
+// so an idle connection holds no buffer while a round keeps its one loan.
+func (c *Conn) parkedInput() {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	if c.offset == len(c.input) && c.postPadding == 0 {
+		c.releaseInputLocked()
+	}
+}
+
 // readIntoInput reads socket bytes straight into the retained input buffer, so
 // a head crosses the copy into the request reader instead of crossing two.
 func (c *Conn) readIntoInput() (int, error) {
@@ -163,12 +173,6 @@ func (c *Conn) readIntoInput() (int, error) {
 	if n > 0 {
 		c.input = c.input[:len(c.input)+n]
 		sys.CountReadInto(n)
-		return n, err
-	}
-	if c.offset == len(c.input) {
-		// Nothing readable and nothing retained: hand the loan back so an
-		// idle connection holds no buffer.
-		c.releaseInputLocked()
 	}
 	return n, err
 }
