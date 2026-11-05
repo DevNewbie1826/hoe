@@ -101,15 +101,18 @@ func poolRunTimerAllocBytes() int64 {
 // burst larger than the cap expires down to the cap, and Close leaves the
 // list empty. The second bubble closes while workers still hold timers, so
 // a release after Close must drop, not append. The expected bound is the
-// literal 8, not a value read back from the production constant, and a
-// separate check pins idleTimerFreeListCap to that same literal: raising
-// the cap must edit the constant and this pin together.
+// test-local wantCap literal, not a value read back from the production
+// constant, and a separate check pins idleTimerFreeListCap to that same
+// literal: raising the cap must edit the constant and wantCap together.
+// The burst's headroom is its own burstHeadroom constant, unrelated to it.
 // Sleep advances the synctest fake clock; it is not a wall-clock wait.
 func TestIdleTimerFreeListCapsAndClearsOnClose(t *testing.T) {
-	if idleTimerFreeListCap != 8 {
-		t.Fatalf("idleTimerFreeListCap=%d, want 8 (raise the literal below with the constant)", idleTimerFreeListCap)
+	const wantCap = 8
+	if idleTimerFreeListCap != wantCap {
+		t.Fatalf("idleTimerFreeListCap=%d, want %d (raise wantCap with the constant)", idleTimerFreeListCap, wantCap)
 	}
-	const burst = idleTimerFreeListCap + 8
+	const burstHeadroom = 8
+	const burst = idleTimerFreeListCap + burstHeadroom
 
 	t.Run("expiry", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
@@ -124,8 +127,8 @@ func TestIdleTimerFreeListCapsAndClearsOnClose(t *testing.T) {
 			if got := p.Workers(); got != 0 {
 				t.Fatalf("expired idle workers retained: %d", got)
 			}
-			if got := idleTimerFreeListLen(p); got != 8 {
-				t.Fatalf("free list len=%d after %d concurrent expiries, want 8", got, burst)
+			if got := idleTimerFreeListLen(p); got != wantCap {
+				t.Fatalf("free list len=%d after %d concurrent expiries, want %d", got, burst, wantCap)
 			}
 			p.Close()
 			if got := idleTimerFreeListLen(p); got != 0 {

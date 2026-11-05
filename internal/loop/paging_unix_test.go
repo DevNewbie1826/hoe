@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package loop_test
 
@@ -81,7 +81,7 @@ func highSocket(t *testing.T) (peer, high int, err error) {
 		return 0, 0, err
 	}
 	high = 1 << 18
-	if err = syscall.Dup3(fds[0], high, 0); err != nil {
+	if err = dupAt(fds[0], high); err != nil {
 		syscall.Close(fds[0])
 		syscall.Close(fds[1])
 		return 0, 0, err
