@@ -14,6 +14,13 @@ type backend struct {
 	events   [MaxEvents]syscall.EpollEvent
 	file     *os.File
 	raw      syscall.RawConn
+	// waitFunc is the RawConn.Read callback. It is a method value set once
+	// in open, so a wait reuses it instead of allocating a closure per call.
+	waitFunc func(uintptr) bool
+	// waitN and waitErr carry the callback's result out of waitFunc. RawConn
+	// may invoke the callback more than once, so every call overwrites them.
+	waitN   int
+	waitErr error
 }
 
 func (p *Poller) open() error {
@@ -45,6 +52,7 @@ func (p *Poller) open() error {
 		return err
 	}
 	p.raw = raw
+	p.waitFunc = p.waitReadyOnce
 	return nil
 }
 
@@ -69,21 +77,24 @@ func (p *Poller) remove(r *registration) error {
 }
 func (p *Poller) waitReady() (int, error) { return syscall.EpollWait(p.fd, p.events[:], 0) }
 
+// waitReadyOnce performs one epoll wait and caches its result for wait. The
+// callback returns false after EINTR so RawConn retries without blocking.
+func (p *Poller) waitReadyOnce(uintptr) bool {
+	n, err := p.waitReady()
+	p.waitN, p.waitErr = n, err
+	if errors.Is(err, syscall.EINTR) {
+		p.waitErr = nil
+		return false
+	}
+	return n > 0 || err != nil
+}
+
 func (p *Poller) wait() (int, error) {
-	var n int
-	var waitErr error
-	err := p.raw.Read(func(uintptr) bool {
-		n, waitErr = p.waitReady()
-		if errors.Is(waitErr, syscall.EINTR) {
-			waitErr = nil
-			return false
-		}
-		return n > 0 || waitErr != nil
-	})
-	if err != nil {
+	p.waitN, p.waitErr = 0, nil
+	if err := p.raw.Read(p.waitFunc); err != nil {
 		return 0, err
 	}
-	return n, waitErr
+	return p.waitN, p.waitErr
 }
 
 func (p *Poller) collect(n int) error {
