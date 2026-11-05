@@ -101,6 +101,10 @@ func (e *Engine) closeResources(force bool) error {
 		}
 		e.closeErr = errors.Join(e.closeErr, e.group.Close())
 		e.timers.close()
+		e.mu.Lock()
+		e.retiredSealed = true
+		clear(e.retired)
+		e.mu.Unlock()
 		trackEngine(e, false)
 		close(e.resourcesClosed)
 	})
