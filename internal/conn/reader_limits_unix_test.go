@@ -11,24 +11,47 @@ import (
 	"time"
 )
 
-// TestPanicAfterChunkedPromotion guards the observable behavior of a handler
-// panic after a chunked body promoted the reader: each aborted connection
-// closes, and the engine keeps serving with a fresh small reader. It does not
-// pin the exact release pointer, so a mutant that releases the pre-promotion
-// reader survives it.
+// TestPanicAfterChunkedPromotion pins the exact release of the pre-promotion
+// small reader when a handler panics after a chunked body promoted the reader:
+// each aborted connection closes, and the engine keeps serving with a fresh
+// small reader. It pins the release pointer via per-connection loan accounting
+// (not an allocation-profile heuristic), so a mutant that never releases the
+// pre-promotion reader fails the loan assertion.
 func TestPanicAfterChunkedPromotion(t *testing.T) {
 	ln, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	p := &parked{ln: ln, entered: make(chan struct{}), release: make(chan struct{})}
-	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if len(r.TransferEncoding) > 0 {
-			panic(http.ErrAbortHandler)
-		}
-		p.entered <- struct{}{}
-		<-p.release
-	})}
+	conns := make(chan *Conn, 16)
+	srv := &http.Server{
+		ConnState: func(nc net.Conn, s http.ConnState) {
+			if s == http.StateNew {
+				select {
+				case conns <- nc.(*Conn):
+				default:
+				}
+			}
+		},
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if len(r.TransferEncoding) > 0 {
+				select {
+				case nc := <-conns:
+					if nc.smallReaderLoans != 1 || nc.smallReaderReleases != 1 {
+						t.Errorf("chunked promotion released %d of %d small reader loans, want 1 of 1", nc.smallReaderReleases, nc.smallReaderLoans)
+					}
+					if nc.readerBytes != 4096 {
+						t.Errorf("chunked promotion serves %d reader bytes, want 4096", nc.readerBytes)
+					}
+				case <-time.After(5 * time.Second):
+					t.Errorf("chunked handler did not receive its connection")
+				}
+				panic(http.ErrAbortHandler)
+			}
+			p.entered <- struct{}{}
+			<-p.release
+		}),
+	}
 	engine, err := New(srv, Policy{KeepAlive: func() bool { return true }})
 	if err != nil {
 		ln.Close()
@@ -63,7 +86,6 @@ func TestPanicAfterChunkedPromotion(t *testing.T) {
 		c.Close()
 	}
 
-	withAllocProfile(t)
 	client, err := net.DialTCP("tcp", nil, ln.Addr().(*net.TCPAddr))
 	if err != nil {
 		t.Fatalf("dial after panics: %v", err)
@@ -71,8 +93,13 @@ func TestPanicAfterChunkedPromotion(t *testing.T) {
 	defer client.Close()
 	writeRaw(t, client, "GET /after HTTP/1.1\r\nHost: t\r\n\r\n")
 	waitPark(t, p.entered)
-	if got := serveReaderBytes(); got == 0 || got >= halfOldReader {
-		t.Fatalf("connection after %d promoted panics retained %d serve-reader bytes, want in (0, %d)", rounds, got, halfOldReader)
+	select {
+	case nc := <-conns:
+		if nc.readerBytes != 1024 {
+			t.Errorf("fresh connection serves %d reader bytes, want 1024", nc.readerBytes)
+		}
+	case <-time.After(5 * time.Second):
+		t.Errorf("after-panic connection was not reported to ConnState")
 	}
 	p.release <- struct{}{}
 	if s := readStatus(t, client, "GET").Status; s != "200 OK" {
