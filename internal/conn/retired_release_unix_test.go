@@ -70,7 +70,19 @@ func TestAdoptCarriesRetiredBaseContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { e.Close() })
+	// Both Serve results are buffered and drained after Close, so neither
+	// sender can block once the engine stops its listeners.
+	served := make(chan error, 2)
+	t.Cleanup(func() {
+		e.Close()
+		for range 2 {
+			select {
+			case <-served:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Serve did not return after engine close")
+			}
+		}
+	})
 	l, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
@@ -83,7 +95,6 @@ func TestAdoptCarriesRetiredBaseContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer keep.Close()
-	served := make(chan error, 1)
 	go func() { served <- e.Serve(l) }()
 	go func() { served <- e.Serve(keep) }()
 	awaitRegistered(t, e, l)
@@ -110,24 +121,47 @@ func TestAdoptCarriesRetiredBaseContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	var fd int
-	raw.Control(func(s uintptr) { fd, err = syscall.Dup(int(s)) })
-	live.Close()
-	if err != nil {
-		t.Fatal(err)
+	var dupErr error
+	if err := raw.Control(func(s uintptr) { fd, dupErr = syscall.Dup(int(s)) }); err != nil {
+		live.Close()
+		t.Fatalf("inspect live socket: %v", err)
 	}
-	t.Cleanup(func() { syscall.Close(fd) })
+	live.Close()
+	if dupErr != nil {
+		t.Fatalf("duplicate live socket: %v", dupErr)
+	}
+	// The test owns the duplicated descriptor only until adopt takes it.
+	// AdoptAsync owns fd on success and on an enqueue error (it closes the
+	// descriptor itself), so the flag is cleared immediately before adopt
+	// and cleanup must not close it afterwards.
+	closeFd := true
+	t.Cleanup(func() {
+		if closeFd {
+			syscall.Close(fd)
+		}
+	})
+	closeFd = false
 	if err := e.adopt(fd, l); err != nil {
 		t.Fatalf("adopt after listener end: %v", err)
 	}
 
-	// The engine registers the socket asynchronously; wait for the
-	// connection to exist, then read the base it was adopted with.
+	// The engine registers the socket asynchronously; wait for it, then read
+	// the base the adopted connection carries. Exactly one connection exists
+	// here, so an ambiguous map walk would hide a registration defect.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		e.mu.Lock()
+		n := len(e.conns)
 		var base context.Context
-		for _, c := range e.conns {
-			base = c.base
+		if n == 1 {
+			// Sole entry: the walk is unambiguous, and reading it cannot pick
+			// a foreign connection out of a larger map.
+			for _, c := range e.conns {
+				base = c.base
+			}
+		} else if n > 1 {
+			e.mu.Unlock()
+			t.Fatalf("engine tracks %d connections after one adoption, want exactly 1; an arbitrary map entry would mask whether the adopted connection registered", n)
 		}
 		e.mu.Unlock()
 		if base != nil {
