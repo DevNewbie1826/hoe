@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"syscall"
 	"testing"
@@ -178,42 +179,143 @@ func TestAcceptReadWriteEcho(t *testing.T) {
 	}
 }
 
+// socketPair returns a connected AF_UNIX stream pair with the transport's
+// descriptor flags. A descriptor pair instead of a TCP listener keeps the
+// churn off the host's connection-tracking table: the invariant under test is
+// registration identity, and real dials only make the test depend on host
+// state that has nothing to do with the loop.
+func socketPair(t *testing.T) [2]int {
+	t.Helper()
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fd := range fds {
+		syscall.CloseOnExec(fd)
+		if err := syscall.SetNonblock(fd, true); err != nil {
+			syscall.Close(fds[0])
+			syscall.Close(fds[1])
+			t.Fatal(err)
+		}
+	}
+	return fds
+}
+
+// peerConn wraps a socketpair end for the test side. Only the descriptor that
+// Group.Adopt owns stays raw; this side is a regular net.Conn so reads can
+// carry a deadline instead of relying on the schedule.
+func peerConn(t *testing.T, fd int) net.Conn {
+	t.Helper()
+	f := os.NewFile(uintptr(fd), "loop-test-peer")
+	c, err := net.FileConn(f)
+	closeErr := f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	t.Cleanup(func() { c.Close() })
+	if err := c.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// TestCloseVsEventFDReuse proves a reused descriptor number cannot revive the
+// command identity of an earlier closed connection. Each iteration adopts a
+// socketpair end, closes it, and adopts the next pair, whose descriptor number
+// the kernel recycles immediately. Stale close and interest commands aimed at
+// the previous lifetime must resolve through its registration token only, so
+// they must neither reach the new registration nor be able to change it.
 func TestCloseVsEventFDReuse(t *testing.T) {
-	h := &echoHandler{open: make(chan *Conn, 32), closed: make(chan *Conn, 32)}
-	_, addr := transport(t, h)
-	last := make(map[int]*Conn)
+	h := &echoHandler{open: make(chan *Conn, 8), closed: make(chan *Conn, 8)}
+	g, err := New(Config{Loops: 2, Handler: h})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := g.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	type lifetime struct {
+		conn *Conn
+		peer net.Conn
+	}
+	last := make(map[int]*lifetime)
 	reused := 0
-	// Each fresh connection has bytes queued alongside old close/interest
-	// commands. Reusing a descriptor must not reuse its command identity.
-	for i := range 5000 {
-		c := dial(t, addr)
+	const rounds = 64
+	for i := range rounds {
+		fds := socketPair(t)
+		if err := g.Adopt(fds[0]); err != nil {
+			syscall.Close(fds[1])
+			t.Fatal(err)
+		}
 		owned := nextConn(t, h.open)
-		if stale := last[owned.fd]; stale != nil {
-			reused++
-			if err := stale.loop.call(&command{kind: closeCommand, conn: stale}); err != nil {
-				t.Fatal(err)
-			}
-			if err := stale.SetInterest(true, true); !errors.Is(err, net.ErrClosed) {
-				t.Fatalf("stale lifetime changed interests: %v", err)
-			}
-		}
-		last[owned.fd] = owned
-		echo(t, c, fmt.Sprintf("connection-%08d", i))
-		c.Close()
-		if closed := nextConn(t, h.closed); closed != owned {
-			t.Fatal("wrong lifetime closed")
-		}
-		if err := owned.SetInterest(true, true); !errors.Is(err, net.ErrClosed) {
-			t.Fatalf("stale interest=%v", err)
-		}
+		peer := peerConn(t, fds[1])
+		payload := fmt.Sprintf("connection-%08d", i)
+		echo(t, peer, payload)
+
+		// Close through the owner and wait for its close callback, so the next
+		// adoption below is guaranteed to see this descriptor released.
 		if err := owned.Close(); err != nil {
 			t.Fatal(err)
 		}
+		if closed := nextConn(t, h.closed); closed != owned {
+			t.Fatal("wrong lifetime closed")
+		}
+
+		if stale := last[owned.fd]; stale != nil {
+			reused++
+			// Recycle the descriptor number and install the new registration
+			// first. The stale commands below then run while the slot is
+			// occupied by a different lifetime, which is the only ordering
+			// that can exercise the identity check.
+			next := socketPair(t)
+			if next[0] != owned.fd {
+				syscall.Close(next[0])
+				syscall.Close(next[1])
+				t.Fatalf("descriptor %d not recycled; got %d", owned.fd, next[0])
+			}
+			if err := g.Adopt(next[0]); err != nil {
+				syscall.Close(next[1])
+				t.Fatal(err)
+			}
+			fresh := nextConn(t, h.open)
+			if fresh.fd != owned.fd {
+				t.Fatalf("adopted fd=%d, want reused %d", fresh.fd, owned.fd)
+			}
+			if err := stale.conn.loop.call(&command{kind: closeCommand, conn: stale.conn}); err != nil {
+				t.Fatal(err)
+			}
+			if err := stale.conn.SetInterest(true, true); !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("stale lifetime changed interests: %v", err)
+			}
+			// The new registration must be untouched by the stale commands.
+			select {
+			case <-fresh.Done():
+				t.Fatal("stale commands closed the reused registration")
+			default:
+			}
+			freshPeer := peerConn(t, next[1])
+			echo(t, freshPeer, payload+"-after-stale")
+			last[owned.fd] = &lifetime{conn: fresh, peer: freshPeer}
+			if err := fresh.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if closed := nextConn(t, h.closed); closed != fresh {
+				t.Fatal("wrong lifetime closed")
+			}
+			continue
+		}
+		last[owned.fd] = &lifetime{conn: owned, peer: peer}
 	}
 	if reused == 0 {
 		t.Fatal("churn did not exercise fd reuse")
 	}
-	t.Logf("5000 connections, %d reused descriptors, zero misrouted bytes", reused)
+	t.Logf("%d rounds, %d reused descriptors, zero misrouted bytes", rounds, reused)
 }
 
 func TestIdleConnectionsHoldNoBuffers(t *testing.T) {
