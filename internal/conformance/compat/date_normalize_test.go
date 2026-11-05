@@ -95,3 +95,30 @@ func TestNormalizeCollapsesGenuineDateDifference(t *testing.T) {
 		t.Fatalf("placeholder missing from %q", na)
 	}
 }
+
+// Every captured differential response passes through normalize, so its cost
+// is paid once per test comparison. Walking the header lines in place keeps
+// the allocation count proportional to the number of responses rather than to
+// the number of header lines, which a per-line split/join would multiply.
+func TestNormalizeAllocationIsFlat(t *testing.T) {
+	response := func(n int) []byte {
+		var b bytes.Buffer
+		for i := 0; i < n; i++ {
+			b.WriteString(httpResponse("Date: "+imfDate+"\r\nContent-Type: text/plain\r\nServer: hoe\r\nContent-Length: 2\r\n", "ok"))
+		}
+		return b.Bytes()
+	}
+	for _, tc := range []struct {
+		name     string
+		in       []byte
+		maxAlloc float64
+	}{
+		{"single", response(1), 8},
+		{"twenty", response(20), 60},
+	} {
+		in := tc.in
+		if got := testing.AllocsPerRun(20, func() { _ = normalize(in) }); got > tc.maxAlloc {
+			t.Errorf("%s: %.1f allocations per normalize, want at most %.0f", tc.name, got, tc.maxAlloc)
+		}
+	}
+}

@@ -16,9 +16,17 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 )
 
-var headerEnd = []byte("\r\n\r\n")
+var (
+	headerEnd  = []byte("\r\n\r\n")
+	crlf       = []byte("\r\n")
+	datePrefix = []byte("Date: ")
+	dateValue  = []byte("Date: DATE")
+)
 
 func normalize(p []byte) []byte {
+	if !bytes.Contains(p, datePrefix) {
+		return p
+	}
 	out := make([]byte, 0, len(p))
 	for len(p) > 0 {
 		i := bytes.Index(p, headerEnd)
@@ -26,7 +34,7 @@ func normalize(p []byte) []byte {
 			return append(out, p...)
 		}
 		head, rest := p[:i+len(headerEnd)], p[i+len(headerEnd):]
-		out = append(out, rewriteDate(head)...)
+		out = appendHead(out, head)
 		code, chunked, length := framing(head)
 		switch {
 		case code == 101:
@@ -53,37 +61,63 @@ func normalize(p []byte) []byte {
 	return out
 }
 
-func rewriteDate(head []byte) []byte {
-	lines := bytes.Split(head, []byte("\r\n"))
-	for i, line := range lines {
-		value, ok := bytes.CutPrefix(line, []byte("Date: "))
-		if !ok {
-			continue
+// appendHead appends head, replacing only those date header lines whose value
+// is a valid HTTP date rendered in the canonical form. Walking lines in place
+// keeps the per-response allocation count flat, which matters because every
+// captured differential response passes through here.
+func appendHead(out, head []byte) []byte {
+	for len(head) > 0 {
+		i := bytes.Index(head, crlf)
+		if i < 0 {
+			return append(out, head...)
 		}
-		t, err := http.ParseTime(string(value))
-		if err == nil && t.Format(http.TimeFormat) == string(value) {
-			lines[i] = []byte("Date: DATE")
-		}
+		out = appendDateLine(out, head[:i])
+		out = append(out, crlf...)
+		head = head[i+len(crlf):]
 	}
-	return bytes.Join(lines, []byte("\r\n"))
+	return out
+}
+
+func appendDateLine(out, line []byte) []byte {
+	value, ok := bytes.CutPrefix(line, datePrefix)
+	if !ok {
+		return append(out, line...)
+	}
+	t, err := http.ParseTime(string(value))
+	if err != nil {
+		return append(out, line...)
+	}
+	var buf [len(http.TimeFormat)]byte
+	if string(t.AppendFormat(buf[:0], http.TimeFormat)) != string(value) {
+		return append(out, line...)
+	}
+	return append(out, dateValue...)
 }
 
 func framing(head []byte) (code int, chunked bool, length int64) {
 	length = -1
-	lines := bytes.Split(head, []byte("\r\n"))
-	if f := bytes.Fields(lines[0]); len(f) >= 2 {
+	line, rest, ok := cutCRLF(head)
+	if !ok {
+		return code, chunked, length
+	}
+	if f := bytes.Fields(line); len(f) >= 2 {
 		code, _ = strconv.Atoi(string(f[1]))
 	}
-	for _, line := range lines[1:] {
+	for len(rest) > 0 {
+		line, rest, ok = cutCRLF(rest)
+		if !ok || len(line) == 0 {
+			break
+		}
 		name, value, ok := bytes.Cut(line, []byte(":"))
 		if !ok {
 			continue
 		}
-		switch strings.ToLower(string(bytes.TrimSpace(name))) {
-		case "transfer-encoding":
-			chunked = strings.Contains(strings.ToLower(string(value)), "chunked")
-		case "content-length":
-			if n, err := strconv.ParseInt(strings.TrimSpace(string(value)), 10, 64); err == nil {
+		name = bytes.TrimSpace(name)
+		switch {
+		case bytes.EqualFold(name, []byte("Transfer-Encoding")):
+			chunked = bytes.Contains(bytes.ToLower(value), []byte("chunked"))
+		case bytes.EqualFold(name, []byte("Content-Length")):
+			if n, err := strconv.ParseInt(string(bytes.TrimSpace(value)), 10, 64); err == nil {
 				length = n
 			}
 		}
@@ -91,9 +125,17 @@ func framing(head []byte) (code int, chunked bool, length int64) {
 	return code, chunked, length
 }
 
+func cutCRLF(p []byte) (line, rest []byte, ok bool) {
+	i := bytes.Index(p, crlf)
+	if i < 0 {
+		return nil, nil, false
+	}
+	return p[:i], p[i+len(crlf):], true
+}
+
 func skipChunks(p []byte) (int, bool) {
 	for i := 0; ; {
-		j := bytes.Index(p[i:], []byte("\r\n"))
+		j := bytes.Index(p[i:], crlf)
 		if j < 0 {
 			return 0, false
 		}
@@ -108,7 +150,7 @@ func skipChunks(p []byte) (int, bool) {
 		i += j + 2
 		if n == 0 {
 			for {
-				k := bytes.Index(p[i:], []byte("\r\n"))
+				k := bytes.Index(p[i:], crlf)
 				if k < 0 {
 					return 0, false
 				}
