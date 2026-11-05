@@ -84,31 +84,38 @@ func TestEchoPathAllocs(t *testing.T) {
 	t.Logf("allocs_per_request=%.2f", n)
 }
 
-// echoBytesPerRequest returns exact allocated bytes per request. TotalAlloc is
-// an exact counter, so this needs no sampling: the reader and writer are reused
-// across the run, leaving only what one request costs.
+// bytesPerRound returns the best of rounds runs of n iterations of round as
+// exact allocated bytes per iteration. TotalAlloc is an exact counter, so this
+// needs no sampling.
+func bytesPerRound(t *testing.T, round func(), rounds, n int) float64 {
+	run := func(m int) uint64 {
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		for range m {
+			round()
+		}
+		runtime.ReadMemStats(&after)
+		return after.TotalAlloc - before.TotalAlloc
+	}
+	run(n)
+	best := float64(1 << 62)
+	for range rounds {
+		if b := float64(run(n)) / float64(n); b < best {
+			best = b
+		}
+	}
+	return best
+}
+
+// echoBytesPerRequest returns exact allocated bytes per echo request.
 func echoBytesPerRequest(t *testing.T, rounds, per int) float64 {
 	out := bufio.NewWriter(io.Discard)
 	tr := &allocTransport{out: out}
 	payload := append([]byte(echoHead), make([]byte, 1024)...)
 	br := bufio.NewReaderSize(bytes.NewReader(payload), 4096)
 	held := make([]byte, 1024)
-	run := func(n int) uint64 {
-		var before, after runtime.MemStats
-		runtime.GC()
-		runtime.ReadMemStats(&before)
-		for range n {
-			echoRound(t, br, payload, out, tr, held)
-		}
-		runtime.ReadMemStats(&after)
-		return after.TotalAlloc - before.TotalAlloc
-	}
-	run(per)
-	best := float64(1 << 62)
-	for range rounds {
-		if b := float64(run(per)) / float64(per); b < best {
-			best = b
-		}
-	}
-	return best
+	return bytesPerRound(t, func() {
+		echoRound(t, br, payload, out, tr, held)
+	}, rounds, per)
 }
