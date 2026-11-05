@@ -171,10 +171,13 @@ func (e *Engine) serveReserved(l *net.TCPListener, st *listenerState) (serveErr 
 }
 
 // endListener stops one listener's acceptance. When the engine's last
-// listener ends, acceptance-stop is published for the finalizer. The state
-// moves to retired rather than being dropped: an accept already returning a
-// backlog connection when the close lands must still adopt it with this
-// listener's base context.
+// listener ends, acceptance-stop is published for the finalizer. The ended
+// listener's state retires rather than being dropped, so an accept already
+// returning a backlog connection when the close lands can still adopt it with
+// this listener's base context. Retirement lasts only while the engine's
+// resources are still open: closeResources seals retiredSealed and clears the
+// retired map, after which a lagging endListener drops the state instead of
+// re-pinning it (endListener must not retire once resources close).
 func (e *Engine) endListener(l *net.TCPListener) {
 	e.mu.Lock()
 	st := e.listeners[l]
