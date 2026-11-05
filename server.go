@@ -245,6 +245,14 @@ func (s *Server) ServeAll(listeners ...net.Listener) error {
 	if eng != nil && !errors.Is(err, ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 		eng.Close()
 	}
+	if eng != nil {
+		go func(e *conn.Engine) {
+			<-e.Done()
+			s.mu.Lock()
+			delete(s.engines, e)
+			s.mu.Unlock()
+		}(eng)
+	}
 	return err
 }
 

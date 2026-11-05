@@ -26,6 +26,7 @@ type Engine struct {
 	group           *loop.Group
 	listeners       map[*net.TCPListener]*listenerState // guarded by mu
 	retired         map[*net.TCPListener]*listenerState // guarded by mu; states of ended listeners, kept so a backlog accept racing the close still adopts with its listener's base context
+	retiredSealed   bool                                // guarded by mu; endListener must not retire once resources close
 	mu              sync.Mutex
 	conns           map[*loop.Conn]*Conn
 	opening         int   // guarded by mu; adopted sockets awaiting OnOpen completion
@@ -166,6 +167,10 @@ func tcpAddr(sa syscall.Sockaddr) *net.TCPAddr {
 		return &net.TCPAddr{}
 	}
 }
+
+// Done closes when the engine's resources are finalized, so a server can
+// stop tracking a finished engine.
+func (e *Engine) Done() <-chan struct{} { return e.finalized }
 
 // Supported reports whether plaintext TCP can use the event engine.
 func Supported() bool { return true }

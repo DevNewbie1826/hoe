@@ -36,3 +36,6 @@ func (*Engine) Close() error { return nil }
 
 // CloseIdle has no engine resources on this platform.
 func (*Engine) CloseIdle() {}
+
+// Done never closes: there are no engine resources to finalize.
+func (*Engine) Done() <-chan struct{} { return nil }

@@ -179,7 +179,7 @@ func (e *Engine) endListener(l *net.TCPListener) {
 	e.mu.Lock()
 	st := e.listeners[l]
 	delete(e.listeners, l)
-	if st != nil {
+	if st != nil && !e.retiredSealed {
 		e.retired[l] = st
 	}
 	last := len(e.listeners) == 0
