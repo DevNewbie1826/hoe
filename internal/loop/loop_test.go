@@ -242,7 +242,6 @@ func TestCloseVsEventFDReuse(t *testing.T) {
 
 	type lifetime struct {
 		conn *Conn
-		peer net.Conn
 	}
 	last := make(map[int]*lifetime)
 	reused := 0
@@ -301,7 +300,7 @@ func TestCloseVsEventFDReuse(t *testing.T) {
 			}
 			freshPeer := peerConn(t, next[1])
 			echo(t, freshPeer, payload+"-after-stale")
-			last[owned.fd] = &lifetime{conn: fresh, peer: freshPeer}
+			last[owned.fd] = &lifetime{conn: fresh}
 			if err := fresh.Close(); err != nil {
 				t.Fatal(err)
 			}
@@ -310,7 +309,7 @@ func TestCloseVsEventFDReuse(t *testing.T) {
 			}
 			continue
 		}
-		last[owned.fd] = &lifetime{conn: owned, peer: peer}
+		last[owned.fd] = &lifetime{conn: owned}
 	}
 	if reused == 0 {
 		t.Fatal("churn did not exercise fd reuse")

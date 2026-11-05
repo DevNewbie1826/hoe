@@ -13,11 +13,6 @@ import (
 // between waits, so sequential idle waits allocate exactly one timer. The
 // assertion is deterministic and holds under -race.
 func TestSequentialIdleWaitsShareTimers(t *testing.T) {
-	// Publish frees before the next test reads in-use bytes.
-	t.Cleanup(func() {
-		runtime.GC()
-		runtime.GC()
-	})
 	prevRate := runtime.MemProfileRate
 	runtime.MemProfileRate = 1
 	t.Cleanup(func() { runtime.MemProfileRate = prevRate })
@@ -41,8 +36,7 @@ func TestSequentialIdleWaitsShareTimers(t *testing.T) {
 		if extraBytes := poolRunTimerAllocBytes() - before - first; extraBytes != 0 {
 			t.Fatalf("idle waits allocated %d more Pool.run timer bytes, want 0 (first=%d waits=%d)", extraBytes, first, extra)
 		}
-		// Fire the idle timer. Stop leaves a heap zombie the next test still
-		// counts as Pool.run in-use bytes.
+		// Fire the idle timer so the worker expires and drains the pool.
 		time.Sleep(time.Hour + time.Second)
 		synctest.Wait()
 		if n := p.Workers(); n != 0 {
@@ -65,11 +59,15 @@ func idleOnce(t *testing.T, p *Pool) {
 }
 
 func poolRunTimerAllocBytes() int64 {
-	// MemProfile publishes allocs on a GC cycle.
+	// MemProfile publishes allocs on a GC cycle, and the snapshot may lag
+	// one more; two collections settle it. inuse=true keeps fully-freed
+	// buckets in the profile - the runtime drops them when inuse=false -
+	// so this cumulative sum only grows and deltas cannot go negative.
+	runtime.GC()
 	runtime.GC()
 	var recs []runtime.MemProfileRecord
 	for {
-		n, ok := runtime.MemProfile(recs, false)
+		n, ok := runtime.MemProfile(recs, true)
 		if ok {
 			recs = recs[:n]
 			break
@@ -100,11 +98,17 @@ func poolRunTimerAllocBytes() int64 {
 }
 
 // TestIdleTimerFreeListCapsAndClearsOnClose pins the free-list bound. A
-// burst larger than idleTimerFreeListCap expires down to that cap, and
-// Close leaves the list empty. The second bubble closes while workers
-// still hold timers, so a release after Close must drop, not append.
+// burst larger than the cap expires down to the cap, and Close leaves the
+// list empty. The second bubble closes while workers still hold timers, so
+// a release after Close must drop, not append. The expected bound is the
+// literal 8, not a value read back from the production constant, and a
+// separate check pins idleTimerFreeListCap to that same literal: raising
+// the cap must edit the constant and this pin together.
 // Sleep advances the synctest fake clock; it is not a wall-clock wait.
 func TestIdleTimerFreeListCapsAndClearsOnClose(t *testing.T) {
+	if idleTimerFreeListCap != 8 {
+		t.Fatalf("idleTimerFreeListCap=%d, want 8 (raise the literal below with the constant)", idleTimerFreeListCap)
+	}
 	const burst = idleTimerFreeListCap + 8
 
 	t.Run("expiry", func(t *testing.T) {
@@ -120,8 +124,8 @@ func TestIdleTimerFreeListCapsAndClearsOnClose(t *testing.T) {
 			if got := p.Workers(); got != 0 {
 				t.Fatalf("expired idle workers retained: %d", got)
 			}
-			if got := idleTimerFreeListLen(p); got != idleTimerFreeListCap {
-				t.Fatalf("free list len=%d after %d concurrent expiries, want cap %d", got, burst, idleTimerFreeListCap)
+			if got := idleTimerFreeListLen(p); got != 8 {
+				t.Fatalf("free list len=%d after %d concurrent expiries, want 8", got, burst)
 			}
 			p.Close()
 			if got := idleTimerFreeListLen(p); got != 0 {

@@ -15,8 +15,10 @@ import (
 
 // TestHighFDRegistrationRetainsNoDenseTable pins registration storage to the
 // live set. Adopting one descriptor at 1<<18 must not retain the fd-indexed
-// pointer array that table grew to fd+1 (2 MiB). The bound is 1 MiB, half of
-// that array, not a size read back from the reactor.
+// pointer array that table grew to fd+1 (2 MiB). The guard reads the in-use
+// delta across the adoption only, GC-settled at both samples, so allocations
+// earlier tests leave behind cannot trip it; the bound is 1 MiB, half of that
+// array, not a size read back from the reactor.
 func TestHighFDRegistrationRetainsNoDenseTable(t *testing.T) {
 	opened := make(chan struct{})
 	g, err := loop.New(loop.Config{Loops: 1, Handler: &highFDHandler{opened: opened}})
@@ -37,6 +39,12 @@ func TestHighFDRegistrationRetainsNoDenseTable(t *testing.T) {
 	runtime.MemProfileRate = 1
 	t.Cleanup(func() { runtime.MemProfileRate = prev })
 
+	loopInUse := func() int64 {
+		return inUseBytes(func(rec runtime.MemProfileRecord, fr runtime.Frame) bool {
+			return strings.Contains(fr.File, "internal/loop/")
+		})
+	}
+	before := loopInUse()
 	if err := g.Adopt(high); err != nil {
 		t.Fatal(err)
 	}
@@ -47,10 +55,8 @@ func TestHighFDRegistrationRetainsNoDenseTable(t *testing.T) {
 	}
 
 	const denseTable = 1 << 20
-	if got := inUseBytes(func(rec runtime.MemProfileRecord, fr runtime.Frame) bool {
-		return rec.InUseBytes() >= denseTable && strings.Contains(fr.File, "internal/loop/")
-	}); got != 0 {
-		t.Fatalf("high fd registration retained %d bytes in internal/loop, want none at or above %d", got, denseTable)
+	if got := loopInUse() - before; got >= denseTable {
+		t.Fatalf("high fd adoption grew internal/loop in-use by %d bytes, want < %d", got, denseTable)
 	}
 }
 
@@ -91,6 +97,8 @@ func highSocket(t *testing.T) (peer, high int, err error) {
 }
 
 func inUseBytes(match func(runtime.MemProfileRecord, runtime.Frame) bool) int64 {
+	// The in-use snapshot may lag one GC cycle; two collections settle it.
+	runtime.GC()
 	runtime.GC()
 	var recs []runtime.MemProfileRecord
 	for {
