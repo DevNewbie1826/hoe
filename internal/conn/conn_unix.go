@@ -163,6 +163,12 @@ func (c *Conn) readIntoInput() (int, error) {
 	if n > 0 {
 		c.input = c.input[:len(c.input)+n]
 		sys.CountReadInto(n)
+		return n, err
+	}
+	if c.offset == len(c.input) {
+		// Nothing readable and nothing retained: hand the loan back so an
+		// idle connection holds no buffer.
+		c.releaseInputLocked()
 	}
 	return n, err
 }
